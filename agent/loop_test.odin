@@ -1,0 +1,242 @@
+package agent
+
+// Runnable check for the agent loop itself, no network: a scripted Stream_Fn
+// plays canned assistant responses; a fake tool records executions. Covers
+// the tool round-trip, steering injection, follow-up drain, before_tool_call
+// blocking, and abort — the full Loop_Config seam surface.
+
+import "core:encoding/json"
+import "core:mem"
+import "core:sync"
+import "core:testing"
+
+import "../ai"
+
+Fake :: struct {
+	responses:   []ai.Message, // one scripted assistant message per stream call
+	call_idx:    int,
+	contexts:    [dynamic][]ai.Message, // request snapshots for assertions
+	tools_ran:   [dynamic]string,
+	steer:       []Agent_Message,
+	steer_sent:  bool,
+	follow:      []Agent_Message,
+	follow_sent: bool,
+	block_tools: bool,
+	allocator:   mem.Allocator,
+}
+
+Fake_Stream :: struct {
+	f:    ^Fake,
+	msg:  ai.Message,
+	step: int,
+}
+
+fake_next :: proc(s: ^ai.Stream) -> (ai.Event, bool) {
+	fs := cast(^Fake_Stream)s.data
+	fs.step += 1
+	switch fs.step {
+	case 1:
+		if len(fs.msg.text) > 0 {
+			return ai.Event{kind = .Text_Delta, text = fs.msg.text, partial = &fs.msg}, true
+		}
+		return fake_next(s) // no text → jump straight to Done
+	case 2:
+		return ai.Event {
+			kind    = .Done,
+			reason  = fs.msg.stop_reason,
+			usage   = fs.msg.usage,
+			partial = &fs.msg,
+		}, true
+	}
+	return {}, false
+}
+
+fake_result :: proc(s: ^ai.Stream) -> ai.Message {
+	return (cast(^Fake_Stream)s.data).msg
+}
+
+fake_close :: proc(s: ^ai.Stream) {}
+
+rig_stream :: proc(
+	model: ai.Model,
+	ctx: ai.Context,
+	api_key: string,
+	cancel: ^ai.Cancellation,
+	allocator: mem.Allocator,
+) -> (
+	ai.Stream,
+	ai.Error,
+) {
+	f := cast(^Fake)model.data
+	snap := make([]ai.Message, len(ctx.messages), f.allocator)
+	for m, i in ctx.messages {
+		snap[i] = m
+	}
+	append(&f.contexts, snap)
+
+	fs := new(Fake_Stream, f.allocator)
+	fs.f = f
+	if ai.is_cancelled(cancel) {
+		fs.msg = ai.Message{role = .Assistant, stop_reason = .Aborted}
+		fs.step = 1
+	} else {
+		assert(f.call_idx < len(f.responses), "fake ran out of scripted responses")
+		fs.msg = f.responses[f.call_idx]
+		f.call_idx += 1
+	}
+	return ai.Stream{data = fs, next = fake_next, result = fake_result, close = fake_close}, nil
+}
+
+rig_tool :: proc(
+	call_id: string,
+	args: json.Value,
+	cancel: ^ai.Cancellation,
+	on_update: proc(text: string, userdata: rawptr),
+	userdata: rawptr,
+) -> Tool_Result {
+	f := cast(^Fake)userdata
+	append(&f.tools_ran, call_id)
+	return {text = "fake-out"}
+}
+
+rig_steer :: proc(userdata: rawptr) -> []Agent_Message {
+	f := cast(^Fake)userdata
+	if f.steer_sent {
+		return nil
+	}
+	f.steer_sent = true
+	return f.steer
+}
+
+rig_follow :: proc(userdata: rawptr) -> []Agent_Message {
+	f := cast(^Fake)userdata
+	if f.follow_sent {
+		return nil
+	}
+	f.follow_sent = true
+	return f.follow
+}
+
+rig_block :: proc(call: ai.Tool_Call, userdata: rawptr) -> (bool, string) {
+	f := cast(^Fake)userdata
+	return f.block_tools, "blocked by test"
+}
+
+noop_emit :: proc(event: Event, userdata: rawptr) {}
+
+new_rig :: proc(responses: []ai.Message, allocator: mem.Allocator) -> ^Fake {
+	f := new(Fake, allocator)
+	f.responses = responses
+	f.allocator = allocator
+	f.contexts = make([dynamic][]ai.Message, 0, 8, allocator)
+	f.tools_ran = make([dynamic]string, 0, 8, allocator)
+	return f
+}
+
+rig_ctx :: proc(f: ^Fake, allocator: mem.Allocator) -> (^Context, ^Loop_Config) {
+	tools := make([]Tool_Definition, 1, allocator) // heap — stack literal would dangle past rig_ctx's return
+	tools[0] = Tool_Definition {
+		name            = "fake",
+		description     = "test tool",
+		parameters_json = `{"type":"object","properties":{}}`,
+		execute         = rig_tool,
+		userdata        = f,
+	}
+	ctx := new(Context, allocator)
+	ctx.system_prompt = "test"
+	ctx.tools = tools
+	cfg := new(Loop_Config, allocator)
+	cfg.model = ai.Model{id = "fake", data = rawptr(f)}
+	cfg.stream = rig_stream
+	cfg.get_steering = rig_steer
+	cfg.get_follow_up = rig_follow
+	cfg.before_tool_call = rig_block
+	cfg.userdata = f
+	return ctx, cfg
+}
+
+@(test)
+test_tool_round_trip :: proc(t: ^testing.T) {
+	f := new_rig([]ai.Message{
+		{role = .Assistant, tool_calls = {{id = "c1", name = "fake", arguments = `{}`}}, stop_reason = .Tool_Calls},
+		{role = .Assistant, text = "done", stop_reason = .Stop},
+	}, context.temp_allocator)
+	ctx, cfg := rig_ctx(f, context.temp_allocator)
+	cancel := ai.Cancellation{}
+
+	err := run(ctx, cfg, {{role = .User, text = "go"}}, noop_emit, nil, &cancel, context.temp_allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, len(f.tools_ran), 1)
+	testing.expect_value(t, f.tools_ran[0], "c1")
+
+	testing.expect(t, len(f.contexts) == 2, "expected two model calls")
+	last := f.contexts[1][len(f.contexts[1]) - 1]
+	testing.expect_value(t, last.role, ai.Role.Tool)
+	testing.expect_value(t, last.tool_call_id, "c1")
+	testing.expect_value(t, last.text, "fake-out")
+}
+
+@(test)
+test_steering_and_followup :: proc(t: ^testing.T) {
+	f := new_rig([]ai.Message{
+		{role = .Assistant, text = "ack", stop_reason = .Stop},
+		{role = .Assistant, text = "done", stop_reason = .Stop},
+	}, context.temp_allocator)
+	f.steer = []Agent_Message{{role = .User, text = "steered"}}
+	f.follow = []Agent_Message{{role = .User, text = "followed"}}
+	ctx, cfg := rig_ctx(f, context.temp_allocator)
+	cancel := ai.Cancellation{}
+
+	err := run(ctx, cfg, {{role = .User, text = "go"}}, noop_emit, nil, &cancel, context.temp_allocator)
+	testing.expect_value(t, err, Error.None)
+
+	// steering drained before first generation → request 1 must contain it
+	found_steer := false
+	for m in f.contexts[0] {
+		if m.text == "steered" {
+			found_steer = true
+		}
+	}
+	testing.expect(t, found_steer, "steering message must reach the model")
+
+	// follow-up triggers a second call after the run would settle
+	testing.expect(t, len(f.contexts) == 2, "expected second model call")
+	found_follow := false
+	for m in f.contexts[1] {
+		if m.text == "followed" {
+			found_follow = true
+		}
+	}
+	testing.expect(t, found_follow, "follow-up message must reach the model")
+}
+
+@(test)
+test_blocked_tool :: proc(t: ^testing.T) {
+	f := new_rig([]ai.Message{
+		{role = .Assistant, tool_calls = {{id = "c1", name = "fake", arguments = `{}`}}, stop_reason = .Tool_Calls},
+		{role = .Assistant, text = "done", stop_reason = .Stop},
+	}, context.temp_allocator)
+	f.block_tools = true
+	ctx, cfg := rig_ctx(f, context.temp_allocator)
+	cancel := ai.Cancellation{}
+
+	err := run(ctx, cfg, {{role = .User, text = "go"}}, noop_emit, nil, &cancel, context.temp_allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expect_value(t, len(f.tools_ran), 0)
+	last := f.contexts[1][len(f.contexts[1]) - 1]
+	testing.expect_value(t, last.role, ai.Role.Tool)
+	testing.expect_value(t, last.text, "blocked by test")
+}
+
+@(test)
+test_abort :: proc(t: ^testing.T) {
+	f := new_rig([]ai.Message{
+		{role = .Assistant, text = "never", stop_reason = .Stop},
+	}, context.temp_allocator)
+	ctx, cfg := rig_ctx(f, context.temp_allocator)
+	cancel := ai.Cancellation{}
+	sync.atomic_store(&cancel.flag, true)
+
+	err := run(ctx, cfg, {{role = .User, text = "go"}}, noop_emit, nil, &cancel, context.temp_allocator)
+	testing.expect_value(t, err, Error.Aborted)
+}
