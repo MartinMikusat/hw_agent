@@ -2,7 +2,7 @@ package tools
 
 // File tools: read / write / edit, all resolved against a fixed working dir.
 // edit is exact-string replacement; old_string must occur exactly once unless
-// replace_all is set — same contract as pi/opencode edit tools.
+// replace_all is set — every occurrence is replaced.
 
 import "core:encoding/json"
 import "core:fmt"

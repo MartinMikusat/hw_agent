@@ -3,7 +3,6 @@ package main
 // Print mode: `hw_agent "<prompt>" [-model=<id>]`
 // Streams the run to stdout — text deltas raw, tool boundaries marked.
 
-import "core:encoding/json"
 import "core:fmt"
 import "core:os"
 import "core:strings"
@@ -48,9 +47,9 @@ main :: proc() {
 		os.exit(1)
 	}
 
-	api_key := resolve_api_key()
+	api_key := os.get_env("OPENROUTER_API_KEY", context.allocator)
 	if len(api_key) == 0 {
-		fmt.eprintln("no OpenRouter API key: set OPENROUTER_API_KEY (or log in via opencode)")
+		fmt.eprintln("no OpenRouter API key: set OPENROUTER_API_KEY")
 		os.exit(1)
 	}
 
@@ -149,44 +148,4 @@ print_sink :: proc(event: agent.Event, userdata: rawptr) {
 	case agent.Event_Compaction:
 		fmt.printfln("\n[compacted — %d tokens before, kept %d messages]", e.data.tokens_before, len(e.data.tail))
 	}
-}
-
-resolve_api_key :: proc() -> string {
-	if key := os.get_env("OPENROUTER_API_KEY", context.temp_allocator); len(key) > 0 {
-		return key
-	}
-	home := os.get_env("HOME", context.temp_allocator)
-	if len(home) == 0 {
-		return ""
-	}
-	path := fmt.tprintf("%s/.local/share/opencode/auth.json", home)
-	data, err := os.read_entire_file(path, context.temp_allocator)
-	if err != nil {
-		return ""
-	}
-	value, perr := json.parse(data)
-	if perr != nil {
-		return ""
-	}
-	root, rok := value.(json.Object)
-	if !rok {
-		return ""
-	}
-	or_v, or_has := root["openrouter"]
-	if !or_has {
-		return ""
-	}
-	or_obj, or_ok := or_v.(json.Object)
-	if !or_ok {
-		return ""
-	}
-	key_v, key_has := or_obj["key"]
-	if !key_has {
-		return ""
-	}
-	key, key_ok := key_v.(json.String)
-	if !key_ok {
-		return ""
-	}
-	return string(key)
 }

@@ -1,5 +1,5 @@
 // rpc — JSONL stdio front-end. One JSON object per line in, one event per line
-// out. Lets a parent process (OpenPad, tests, scripts) drive the harness.
+// out. Lets a parent process (hw_launcher, tests, scripts) drive the harness.
 //
 //   in:  {"cmd":"prompt","text":"..."}     start a run (mid-run: steers)
 //        {"cmd":"steer","text":"..."}      inject before next generation
