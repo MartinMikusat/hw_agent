@@ -15,6 +15,7 @@ import "core:strings"
 import "core:sync"
 import "core:thread"
 import "core:time"
+import "core:unicode/utf8"
 
 CURL_URL :: "https://openrouter.ai/api/v1/chat/completions"
 MAX_SSE_LINE_BYTES :: 1 << 20
@@ -60,12 +61,38 @@ is_cancelled :: proc(cancel: ^Cancellation) -> bool {
 	return sync.atomic_load(&cancel.flag)
 }
 
+response_schema_valid :: proc(source: string) -> bool {
+	if len(source) > 64 * 1024 || !utf8.valid_string(source) {return false}
+	tokenizer := json.make_tokenizer(source, spec = .JSON)
+	depth, started, closed := 0, false, false
+	for iteration in 0..=len(source) {
+		token, error := json.get_token(&tokenizer)
+		if error == .EOF || token.kind == .EOF {return started && closed && depth == 0}
+		if error != .None || closed || !started && token.kind != .Open_Brace {return false}
+		started = true
+		if token.kind == .Open_Brace || token.kind == .Open_Bracket {depth += 1}
+		if depth > 64 {return false}
+		if token.kind == .Close_Brace || token.kind == .Close_Bracket {depth -= 1}
+		if depth < 0 {return false}
+		closed = depth == 0
+	}
+	return false
+}
+
 request_json :: proc(model: Model, ctx: Context, allocator: mem.Allocator) -> (string, Error) {
 	arena: mem.Dynamic_Arena
 	mem.dynamic_arena_init(&arena)
 	defer mem.dynamic_arena_destroy(&arena)
 	context.allocator = mem.dynamic_arena_allocator(&arena)
 	request_allocator := context.allocator
+	response_schema: json.Value
+	if model.response_schema_json != "" {
+		if !response_schema_valid(model.response_schema_json) {return "", .Parse}
+		parsed, parse_error := json.parse_string(model.response_schema_json, .JSON, false, request_allocator)
+		if parse_error != nil {return "", .Parse}
+		if _, object := parsed.(json.Object); !object {return "", .Parse}
+		response_schema = parsed
+	}
 
 	messages := make([dynamic]json.Value, 0, len(ctx.messages) + 1)
 	if len(ctx.system_prompt) > 0 {
@@ -149,6 +176,16 @@ request_json :: proc(model: Model, ctx: Context, allocator: mem.Allocator) -> (s
 	opts["include_usage"] = json.Boolean(true)
 	root["stream_options"] = json.Value(json.Object(opts))
 	root["messages"] = json.Value(json.Array(messages))
+	if model.response_schema_json != "" {
+		schema := make(map[string]json.Value, 3)
+		schema["name"] = json.String("agent_result")
+		schema["strict"] = json.Boolean(true)
+		schema["schema"] = response_schema
+		format := make(map[string]json.Value, 2)
+		format["type"] = json.String("json_schema")
+		format["json_schema"] = json.Object(schema)
+		root["response_format"] = json.Object(format)
+	}
 	if model.max_output > 0 {
 		root["max_completion_tokens"] = json.Integer(model.max_output)
 	}

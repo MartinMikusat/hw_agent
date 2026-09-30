@@ -124,6 +124,45 @@ test_cancel_worker :: proc(data: rawptr) {
 }
 
 @(test)
+test_response_schema_request_contract :: proc(t: ^testing.T) {
+	arena: mem.Dynamic_Arena
+	mem.dynamic_arena_init(&arena)
+	defer mem.dynamic_arena_destroy(&arena)
+	context.allocator = mem.dynamic_arena_allocator(&arena)
+	model := Model{id = "fixture", response_schema_json = `{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}`}
+	body, error := request_json(model, {}, context.allocator)
+	testing.expect_value(t, error, Error.None)
+	parsed, parse_error := json.parse_string(body, .JSON, false)
+	testing.expect(t, parse_error == nil)
+	format := parsed.(json.Object)["response_format"].(json.Object)
+	testing.expect_value(t, string(format["type"].(json.String)), "json_schema")
+	definition := format["json_schema"].(json.Object)
+	testing.expect_value(t, string(definition["name"].(json.String)), "agent_result")
+	testing.expect(t, bool(definition["strict"].(json.Boolean)))
+	schema := definition["schema"].(json.Object)
+	testing.expect_value(t, string(schema["type"].(json.String)), "object")
+	testing.expect_value(t, string(schema["required"].(json.Array)[0].(json.String)), "answer")
+	model.response_schema_json = ""
+	body, error = request_json(model, {}, context.allocator)
+	testing.expect_value(t, error, Error.None)
+	parsed, parse_error = json.parse_string(body, .JSON, false)
+	testing.expect(t, parse_error == nil)
+	_, has_format := parsed.(json.Object)["response_format"]
+	testing.expect(t, !has_format)
+	model.response_schema_json = strings.concatenate({strings.repeat(`{"nested":`, 63), "{}", strings.repeat("}", 63)})
+	_, error = request_json(model, {}, context.allocator)
+	testing.expect_value(t, error, Error.None)
+	too_deep := strings.concatenate({strings.repeat(`{"nested":`, 64), "{}", strings.repeat("}", 64)})
+	invalid_schemas := []string{"{", `{"type":"object"}garbage`, "[]", "null", `"schema"`, strings.repeat("x", 64 * 1024 + 1), too_deep}
+	for invalid in invalid_schemas {
+		model.response_schema_json = invalid
+		invalid_body, invalid_error := request_json(model, {}, context.allocator)
+		testing.expect_value(t, invalid_error, Error.Parse)
+		testing.expect_value(t, invalid_body, "")
+	}
+}
+
+@(test)
 test_stalled_stream_cancellation_deadline_and_cleanup :: proc(t: ^testing.T) {
 	arena: mem.Dynamic_Arena
 	mem.dynamic_arena_init(&arena)

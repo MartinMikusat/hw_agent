@@ -66,6 +66,7 @@ Model :: struct {
 	max_output:     int,
 	data:           rawptr, // provider- or caller-specific routing hint
 	provider_options: Provider_Options,
+	response_schema_json: string,
 }
 
 Provider_Options :: struct {
