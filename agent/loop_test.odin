@@ -158,7 +158,7 @@ rig_ctx :: proc(f: ^Fake, allocator: mem.Allocator) -> (^Context, ^Loop_Config) 
 @(test)
 test_tool_round_trip :: proc(t: ^testing.T) {
 	f := new_rig([]ai.Message{
-		{role = .Assistant, tool_calls = {{id = "c1", name = "fake", arguments = `{}`}}, stop_reason = .Tool_Calls},
+		{role = .Assistant, thinking = "trace", reasoning_details_json = `[{"type":"reasoning.encrypted","data":"opaque"}]`, tool_calls = {{id = "c1", name = "fake", arguments = `{}`}}, stop_reason = .Tool_Calls},
 		{role = .Assistant, text = "done", stop_reason = .Stop},
 	}, context.temp_allocator)
 	ctx, cfg := rig_ctx(f, context.temp_allocator)
@@ -170,6 +170,8 @@ test_tool_round_trip :: proc(t: ^testing.T) {
 	testing.expect_value(t, f.tools_ran[0], "c1")
 
 	testing.expect(t, len(f.contexts) == 2, "expected two model calls")
+	testing.expect_value(t, f.contexts[1][1].thinking, "trace")
+	testing.expect_value(t, f.contexts[1][1].reasoning_details_json, `[{"type":"reasoning.encrypted","data":"opaque"}]`)
 	last := f.contexts[1][len(f.contexts[1]) - 1]
 	testing.expect_value(t, last.role, ai.Role.Tool)
 	testing.expect_value(t, last.tool_call_id, "c1")

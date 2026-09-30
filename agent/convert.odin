@@ -21,6 +21,8 @@ convert_to_llm :: proc(messages: []Agent_Message, allocator: mem.Allocator) -> [
 			append(&out, ai.Message {
 				role = .Assistant,
 				text = msg.text,
+				thinking = msg.thinking,
+				reasoning_details_json = msg.reasoning_details_json,
 				tool_calls = msg.tool_calls,
 			})
 		case .Tool_Result:
@@ -53,6 +55,7 @@ assistant_from_wire :: proc(msg: ai.Message, timestamp: i64) -> Agent_Message {
 		role = .Assistant,
 		text = msg.text,
 		thinking = msg.thinking,
+		reasoning_details_json = msg.reasoning_details_json,
 		tool_calls = msg.tool_calls,
 		usage = msg.usage,
 		stop_reason = msg.stop_reason,

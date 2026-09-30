@@ -19,6 +19,9 @@ Usage :: struct {
 	input:  int,
 	output: int,
 	total:  int, // provider-reported total incl. cache; 0 when unreported
+	cost_usd: f64,
+	cost_reported: bool,
+	complete: bool,
 }
 
 Role :: enum {
@@ -38,6 +41,7 @@ Message :: struct {
 	role:         Role,
 	text:         string,        // assembled text content
 	thinking:     string,        // assembled reasoning content, when reported
+	reasoning_details_json: string,
 	tool_calls:   []Tool_Call,   // role == .Assistant
 	tool_call_id: string,        // role == .Tool
 	usage:        Usage,         // role == .Assistant, set on done
@@ -61,6 +65,15 @@ Model :: struct {
 	context_window: int,
 	max_output:     int,
 	data:           rawptr, // provider- or caller-specific routing hint
+	provider_options: Provider_Options,
+}
+
+Provider_Options :: struct {
+	require_parameters: bool,
+	data_collection_deny: bool,
+	zdr: bool,
+	timeout_ms: int,
+	endpoint: string, // trusted caller configuration; empty uses OpenRouter
 }
 
 Error :: enum {

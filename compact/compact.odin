@@ -58,7 +58,7 @@ estimate_tokens :: proc(messages: []agent.Agent_Message) -> int {
 }
 
 msg_chars :: proc(m: agent.Agent_Message) -> int {
-	n := len(m.text) + len(m.thinking)
+	n := len(m.text) + len(m.thinking) + len(m.reasoning_details_json)
 	for c in m.tool_calls {
 		n += len(c.name) + len(c.arguments)
 	}

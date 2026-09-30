@@ -22,6 +22,7 @@ Agent_Message :: struct {
 	role:         Agent_Role,
 	text:         string,          // user text, tool output, summary text, bash output
 	thinking:     string,          // assistant reasoning content
+	reasoning_details_json: string,
 	tool_calls:   []ai.Tool_Call,  // role == .Assistant
 	tool_call_id: string,          // role == .Tool_Result
 	is_error:     bool,            // role == .Tool_Result
@@ -41,6 +42,7 @@ Tool_Definition :: struct {
 	description:     string,
 	parameters_json: string, // JSON Schema object as text
 	sequential:      bool,   // force sequential execution within a batch
+	max_output_bytes: int,
 	execute:         proc(
 		call_id: string,
 		args: json.Value,

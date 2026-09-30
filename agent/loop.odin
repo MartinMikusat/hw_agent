@@ -35,6 +35,9 @@ run :: proc(
 ) -> Error {
 	assert(ctx != nil)
 	assert(cfg != nil && cfg.stream != nil)
+	if ctx.messages.allocator.procedure == nil {
+		ctx.messages.allocator = allocator
+	}
 	for p in prompts {
 		assert(p.role == .User || p.role == .Custom)
 	}
@@ -100,6 +103,7 @@ run :: proc(
 				}
 			}
 
+			msg = &ctx.messages[msg_index]
 			emit(Event_Turn_End{message = msg}, emit_userdata)
 			if cfg.should_stop != nil && cfg.should_stop(cfg.userdata) {
 				emit(Event_Agent_End{}, emit_userdata)
@@ -181,7 +185,7 @@ stream_assistant :: proc(
 
 		stream, serr := cfg.stream(cfg.model, llm_ctx, cfg.api_key, cancel, allocator)
 		if serr != nil {
-			return -1, .Stream_Failed
+			return -1, serr == .Aborted ? .Aborted : .Stream_Failed
 		}
 
 		retry := false
@@ -239,6 +243,10 @@ stream_assistant :: proc(
 					})
 					idx = len(ctx.messages) - 1
 				}
+				if ev.partial != nil {
+					sync_partial(&ctx.messages[idx], ev.partial)
+					ctx.messages[idx].usage = ev.partial.usage
+				}
 				ctx.messages[idx].stop_reason = ev.reason == .Aborted ? .Aborted : .Error
 				ctx.messages[idx].text = ev.text
 				if !started {
@@ -285,6 +293,7 @@ stream_assistant :: proc(
 sync_partial :: proc(dst: ^Agent_Message, src: ^ai.Message) {
 	dst.text = src.text
 	dst.thinking = src.thinking
+	dst.reasoning_details_json = src.reasoning_details_json
 	dst.tool_calls = src.tool_calls
 }
 
@@ -425,11 +434,12 @@ run_tool :: proc(tool: ^Tool_Definition, call: ai.Tool_Call, cancel: ^ai.Cancell
 		return Tool_Result{text = fmt.aprintf("Invalid tool arguments: %v", perr, allocator = allocator), is_error = true}
 	}
 	result := tool.execute(call.id, args, cancel, nil, tool.userdata)
-	if len(result.text) > TOOL_OUTPUT_MAX_CHARS {
+	output_limit := tool.max_output_bytes > 0 ? tool.max_output_bytes : TOOL_OUTPUT_MAX_CHARS
+	if len(result.text) > output_limit {
 		result.text = fmt.aprintf(
 			"%s\n[output truncated at %d chars]",
-			result.text[:TOOL_OUTPUT_MAX_CHARS],
-			TOOL_OUTPUT_MAX_CHARS,
+			result.text[:output_limit],
+			output_limit,
 			allocator = allocator,
 		)
 	}

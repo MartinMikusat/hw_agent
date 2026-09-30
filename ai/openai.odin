@@ -13,9 +13,13 @@ import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:sync"
+import "core:thread"
 import "core:time"
 
 CURL_URL :: "https://openrouter.ai/api/v1/chat/completions"
+MAX_SSE_LINE_BYTES :: 1 << 20
+MAX_STREAM_BYTES :: 16 << 20
+MAX_TOOL_CALLS :: 64
 
 OpenAI_Stream :: struct {
 	process:    os.Process,
@@ -31,6 +35,22 @@ OpenAI_Stream :: struct {
 	emitted:    bool, // terminal event delivered
 	allocator:  mem.Allocator,
 	cancel:     ^Cancellation,
+	pending: [MAX_TOOL_CALLS + 3]Event,
+	pending_count: int,
+	pending_cursor: int,
+	text_buf: strings.Builder,
+	thinking_buf: strings.Builder,
+	reasoning_details: [dynamic]string,
+	response_bytes: int,
+	request_path: string,
+	config_path: string,
+	watcher: ^thread.Thread,
+	watch_stop: bool,
+	timed_out: bool,
+	started_at: time.Tick,
+	timeout: time.Duration,
+	waited: bool,
+	read_error: io.Error,
 }
 
 is_cancelled :: proc(cancel: ^Cancellation) -> bool {
@@ -41,7 +61,11 @@ is_cancelled :: proc(cancel: ^Cancellation) -> bool {
 }
 
 request_json :: proc(model: Model, ctx: Context, allocator: mem.Allocator) -> (string, Error) {
-	context.allocator = allocator
+	arena: mem.Dynamic_Arena
+	mem.dynamic_arena_init(&arena)
+	defer mem.dynamic_arena_destroy(&arena)
+	context.allocator = mem.dynamic_arena_allocator(&arena)
+	request_allocator := context.allocator
 
 	messages := make([dynamic]json.Value, 0, len(ctx.messages) + 1)
 	if len(ctx.system_prompt) > 0 {
@@ -63,6 +87,19 @@ request_json :: proc(model: Model, ctx: Context, allocator: mem.Allocator) -> (s
 			m["role"] = json.String("assistant")
 			if len(msg.text) > 0 {
 				m["content"] = json.String(strings.clone(msg.text))
+			}
+			if len(msg.thinking) > 0 {
+				m["reasoning"] = json.String(strings.clone(msg.thinking))
+			}
+			if len(msg.reasoning_details_json) > 0 {
+				details, perr := json.parse_string(msg.reasoning_details_json, .JSON, false, request_allocator)
+				if perr != nil {
+					return "", .Parse
+				}
+				if _, ok := details.(json.Array); !ok {
+					return "", .Parse
+				}
+				m["reasoning_details"] = details
 			}
 			if len(msg.tool_calls) > 0 {
 				calls := make([dynamic]json.Value, 0, len(msg.tool_calls))
@@ -88,8 +125,11 @@ request_json :: proc(model: Model, ctx: Context, allocator: mem.Allocator) -> (s
 
 	tools := make([dynamic]json.Value, 0, len(ctx.tools))
 	for tool in ctx.tools {
-		schema, perr := json.parse_string(tool.parameters_json, .JSON, false, allocator)
+		schema, perr := json.parse_string(tool.parameters_json, .JSON, false, request_allocator)
 		if perr != nil {
+			return "", .Parse
+		}
+		if _, ok := schema.(json.Object); !ok {
 			return "", .Parse
 		}
 		fn := make(map[string]json.Value, 3)
@@ -109,6 +149,23 @@ request_json :: proc(model: Model, ctx: Context, allocator: mem.Allocator) -> (s
 	opts["include_usage"] = json.Boolean(true)
 	root["stream_options"] = json.Value(json.Object(opts))
 	root["messages"] = json.Value(json.Array(messages))
+	if model.max_output > 0 {
+		root["max_completion_tokens"] = json.Integer(model.max_output)
+	}
+	provider_options := model.provider_options
+	if provider_options.require_parameters || provider_options.data_collection_deny || provider_options.zdr {
+		provider := make(map[string]json.Value, 3)
+		if provider_options.require_parameters {
+			provider["require_parameters"] = json.Boolean(true)
+		}
+		if provider_options.data_collection_deny {
+			provider["data_collection"] = json.String("deny")
+		}
+		if provider_options.zdr {
+			provider["zdr"] = json.Boolean(true)
+		}
+		root["provider"] = json.Value(json.Object(provider))
+	}
 	if len(ctx.tools) > 0 {
 		root["tools"] = json.Value(json.Array(tools))
 	}
@@ -132,13 +189,17 @@ write_temp_file :: proc(contents: string, allocator: mem.Allocator) -> (path: st
 		time.to_unix_nanoseconds(time.now()),
 		allocator = allocator,
 	)
-	handle, oerr := os.open(path, {.Write, .Create, .Trunc}, os.perm(0o600))
+	handle, oerr := os.open(path, {.Write, .Create, .Excl}, os.perm(0o600))
 	if oerr != nil {
 		return "", oerr
 	}
 	defer os.close(handle)
-	_, werr := os.write(handle, transmute([]u8)contents)
-	if werr != nil {
+	n, werr := os.write(handle, transmute([]u8)contents)
+	if werr != nil || n != len(contents) {
+		_ = os.remove(path)
+		if werr == nil {
+			werr = io.Error.Short_Write
+		}
 		return "", werr
 	}
 	return path, nil
@@ -156,45 +217,82 @@ stream_openai :: proc(
 ) {
 	assert(len(api_key) > 0, "stream_openai requires an API key")
 	assert(len(model.id) > 0, "stream_openai requires a model id")
+	if is_cancelled(cancel) {
+		return {}, .Aborted
+	}
+	for c in api_key {
+		if c < 0x20 || c == 0x7f || c == '"' || c == '\\' {
+			return {}, .Parse
+		}
+	}
+	if model.provider_options.timeout_ms < 0 || model.provider_options.timeout_ms > 86_400_000 {
+		return {}, .Parse
+	}
+	arena: mem.Dynamic_Arena
+	mem.dynamic_arena_init(&arena)
+	defer mem.dynamic_arena_destroy(&arena)
+	request_allocator := mem.dynamic_arena_allocator(&arena)
+	retained := false
 
-	body, berr := request_json(model, ctx, allocator)
+	body, berr := request_json(model, ctx, request_allocator)
 	if berr != nil {
 		return {}, berr
 	}
-	body_path, perr := write_temp_file(body, allocator)
+	body_path, perr := write_temp_file(body, request_allocator)
 	if perr != nil {
 		return {}, .Transport
+	}
+	defer if !retained {
+		remove_temp_file(body_path)
+	}
+	config := fmt.aprintf("header = \"Authorization: Bearer %s\"\n", api_key, allocator = request_allocator)
+	config_path, cerr := write_temp_file(config, request_allocator)
+	if cerr != nil {
+		return {}, .Transport
+	}
+	defer if !retained {
+		remove_temp_file(config_path)
 	}
 
 	stdout_r, stdout_w, pipe_err := os.pipe()
 	if pipe_err != nil {
 		return {}, .Transport
 	}
-
-	stderr_path := fmt.aprintf("%s.stderr", body_path, allocator = allocator)
-	stderr_handle, serr := os.open(stderr_path, {.Write, .Create, .Trunc}, os.perm(0o600))
-	if serr != nil {
+	defer os.close(stdout_w)
+	defer if !retained {
 		os.close(stdout_r)
-		os.close(stdout_w)
-		return {}, .Transport
 	}
 
-	auth_header := fmt.aprintf("Authorization: Bearer %s", api_key, allocator = allocator)
-	data_arg := fmt.aprintf("@%s", body_path, allocator = allocator)
+	stderr_path := fmt.aprintf("%s.stderr", body_path, allocator = request_allocator)
+	stderr_handle, serr := os.open(stderr_path, {.Write, .Create, .Excl}, os.perm(0o600))
+	if serr != nil {
+		return {}, .Transport
+	}
+	defer os.close(stderr_handle)
+	defer if !retained {
+		remove_temp_file(stderr_path)
+	}
+
+	data_arg := fmt.aprintf("@%s", body_path, allocator = request_allocator)
+	endpoint := model.provider_options.endpoint
+	if len(endpoint) == 0 {
+		endpoint = CURL_URL
+	}
 
 	process, spawn_err := os.process_start(os.Process_Desc {
 		command = {
 			"curl",
+			"-q",
+			"--config",
+			config_path,
 			"-sS",
 			"-N",
 			"--fail-with-body",
 			"-X",
 			"POST",
-			CURL_URL,
+			endpoint,
 			"-H",
 			"Content-Type: application/json",
-			"-H",
-			auth_header,
 			"-H",
 			"HTTP-Referer: https://github.com/MartinMikusat/hw_agent",
 			"-H",
@@ -205,22 +303,34 @@ stream_openai :: proc(
 		stdout = stdout_w,
 		stderr = stderr_handle,
 	})
-	os.close(stdout_w)
-	os.close(stderr_handle)
 	if spawn_err != nil {
-		os.close(stdout_r)
 		return {}, .Transport
 	}
 
 	impl := new(OpenAI_Stream, allocator)
 	impl.process = process
 	impl.pipe_out = stdout_r
-	impl.stderr_log = stderr_path
+	impl.stderr_log = strings.clone(stderr_path, allocator)
+	impl.request_path = strings.clone(body_path, allocator)
+	impl.config_path = strings.clone(config_path, allocator)
 	impl.allocator = allocator
 	impl.cancel = cancel
 	impl.partial.role = .Assistant
 	impl.reason = .None
-	bufio.reader_init(&impl.reader, os.to_reader(stdout_r))
+	impl.started_at = time.tick_now()
+	impl.timeout = time.Duration(model.provider_options.timeout_ms) * time.Millisecond
+	bufio.reader_init(&impl.reader, os.to_reader(stdout_r), MAX_SSE_LINE_BYTES + 1, allocator)
+	if cancel != nil || impl.timeout > 0 {
+		impl.watcher = thread.create_and_start_with_data(impl, openai_watch)
+		if impl.watcher == nil {
+			_ = os.process_kill(process)
+			_, _ = os.process_wait(process)
+			bufio.reader_destroy(&impl.reader)
+			free(impl, allocator)
+			return {}, .Transport
+		}
+	}
+	retained = true
 
 	return Stream {
 		data = impl,
@@ -236,23 +346,70 @@ openai_stream_result :: proc(s: ^Stream) -> Message {
 }
 
 openai_stream_close :: proc(s: ^Stream) {
+	if s.data == nil {
+		return
+	}
 	impl := cast(^OpenAI_Stream)s.data
+	stop_watcher(impl)
 	if impl.pipe_out != nil {
 		os.close(impl.pipe_out)
 	}
-	_ = os.process_kill(impl.process)
-	_, _ = os.process_wait(impl.process)
+	if !impl.waited {
+		_ = os.process_kill(impl.process)
+		_, _ = os.process_wait(impl.process)
+	}
+	bufio.reader_destroy(&impl.reader)
+	remove_temp_file(impl.request_path)
+	remove_temp_file(impl.config_path)
+	remove_temp_file(impl.stderr_log)
+	free(impl, impl.allocator)
+	s.data = nil
+}
+
+remove_temp_file :: proc(path: string) {
+	if err := os.remove(path); err != nil {
+		fmt.eprintfln("hw_agent: cannot remove temporary file %s: %v", path, err)
+	}
+}
+
+openai_watch :: proc(data: rawptr) {
+	impl := cast(^OpenAI_Stream)data
+	for !sync.atomic_load(&impl.watch_stop) {
+		if is_cancelled(impl.cancel) {
+			_ = os.process_kill(impl.process)
+			return
+		}
+		if impl.timeout > 0 && time.tick_since(impl.started_at) >= impl.timeout {
+			sync.atomic_store(&impl.timed_out, true)
+			_ = os.process_kill(impl.process)
+			return
+		}
+		time.sleep(10 * time.Millisecond)
+	}
+}
+
+stop_watcher :: proc(impl: ^OpenAI_Stream) {
+	sync.atomic_store(&impl.watch_stop, true)
+	if impl.watcher != nil {
+		thread.join(impl.watcher)
+		thread.destroy(impl.watcher)
+		impl.watcher = nil
+	}
 }
 
 // Pull one logical line from the buffered pipe reader. bufio.Reader keeps
 // returning the leftover bytes after EOF, then reports .EOF with an empty
 // line on the next call, so no extra drain bookkeeping is needed here.
 next_line :: proc(impl: ^OpenAI_Stream) -> (line: string, ok: bool) {
-	raw, _ := bufio.reader_read_string(&impl.reader, '\n', impl.allocator)
+	raw, err := bufio.reader_read_slice(&impl.reader, '\n')
+	if err != nil && err != .EOF {
+		impl.read_error = err
+		return "", false
+	}
 	if len(raw) == 0 {
 		return "", false
 	}
-	return strings.trim_right(raw, "\r\n"), true
+	return strings.trim_right(string(raw), "\r\n"), true
 }
 
 openai_stream_next :: proc(s: ^Stream) -> (Event, bool) {
@@ -262,38 +419,40 @@ openai_stream_next :: proc(s: ^Stream) -> (Event, bool) {
 	}
 	if is_cancelled(impl.cancel) {
 		impl.emitted = true
-		finalize_partial(impl)
-		impl.final.stop_reason = .Aborted
-		return Event{kind = .Error, text = "aborted", reason = .Aborted, partial = &impl.final}, true
+		return stream_error(impl, "aborted", .Aborted), true
+	}
+	if event, has := next_pending(impl); has {
+		return event, true
 	}
 
 	for {
 		line, has_line := next_line(impl)
 		if !has_line {
-			state, _ := os.process_wait(impl.process)
 			impl.emitted = true
-			finalize_partial(impl)
+			if is_cancelled(impl.cancel) {
+				return stream_error(impl, "aborted", .Aborted), true
+			}
+			if sync.atomic_load(&impl.timed_out) {
+				return stream_error(impl, "provider request timed out"), true
+			}
+			if impl.read_error != nil {
+				return stream_error(impl, "provider response read failed or exceeded line limit"), true
+			}
+			stop_watcher(impl)
+			state, wait_err := os.process_wait(impl.process)
+			impl.waited = wait_err == nil
+			if wait_err != nil {
+				return stream_error(impl, "cannot wait for provider process"), true
+			}
 			if state.exit_code != 0 {
-				impl.final.stop_reason = .Error
 				msg := fmt.aprintf(
-					"curl exited %d (stderr: %s)",
+					"curl exited %d",
 					state.exit_code,
-					impl.stderr_log,
 					allocator = impl.allocator,
 				)
-				return Event{kind = .Error, text = msg, reason = .Error, partial = &impl.final}, true
+				return stream_error(impl, msg), true
 			}
-			if impl.reason == .None {
-				impl.reason = .Stop
-			}
-			impl.final.stop_reason = impl.reason
-			impl.final.usage = impl.usage
-			return Event {
-				kind = .Done,
-				reason = impl.final.stop_reason,
-				usage = impl.usage,
-				partial = &impl.final,
-			}, true
+			return stream_error(impl, "provider stream ended without [DONE]"), true
 		}
 		if len(os.get_env("HW_DEBUG", context.temp_allocator)) > 0 {
 			fmt.eprintfln("[sse] %s", line)
@@ -317,10 +476,59 @@ finalize_partial :: proc(impl: ^OpenAI_Stream) {
 		}
 		impl.partial.tool_calls = calls
 	}
+	if len(impl.reasoning_details) > 0 {
+		b := strings.builder_make(impl.allocator)
+		strings.write_string(&b, "[")
+		for detail, i in impl.reasoning_details {
+			if i > 0 {
+				strings.write_string(&b, ",")
+			}
+			strings.write_string(&b, detail)
+		}
+		strings.write_string(&b, "]")
+		impl.partial.reasoning_details_json = strings.to_string(b)
+	}
 	impl.final = impl.partial
 }
 
+next_pending :: proc(impl: ^OpenAI_Stream) -> (Event, bool) {
+	if impl.pending_cursor >= impl.pending_count {
+		impl.pending_cursor = 0
+		impl.pending_count = 0
+		return {}, false
+	}
+	event := impl.pending[impl.pending_cursor]
+	impl.pending_cursor += 1
+	return event, true
+}
+
+queue_delta :: proc(impl: ^OpenAI_Stream, kind: Event_Kind, text: string) {
+	assert(impl.pending_count < len(impl.pending))
+	impl.pending[impl.pending_count] = Event {
+		kind = kind,
+		text = strings.clone(text, impl.allocator),
+		partial = &impl.partial,
+	}
+	impl.pending_count += 1
+}
+
+stream_error :: proc(impl: ^OpenAI_Stream, text: string, reason: Stop_Reason = .Error) -> Event {
+	finalize_partial(impl)
+	impl.final.stop_reason = reason
+	impl.final.usage = impl.usage
+	impl.final.usage.complete = false
+	return Event {kind = .Error, text = text, reason = reason, partial = &impl.final}
+}
+
 handle_sse_line :: proc(impl: ^OpenAI_Stream, line: string) -> (Event, bool) {
+	context.allocator = impl.allocator
+	assert(impl.pending_cursor == impl.pending_count)
+	impl.pending_cursor = 0
+	impl.pending_count = 0
+	if len(line) > MAX_SSE_LINE_BYTES || len(line) > MAX_STREAM_BYTES - impl.response_bytes {
+		return stream_error(impl, "provider response exceeded byte limit"), true
+	}
+	impl.response_bytes += len(line)
 	if len(line) == 0 || line[0] == ':' {
 		return {}, false
 	}
@@ -329,6 +537,16 @@ handle_sse_line :: proc(impl: ^OpenAI_Stream, line: string) -> (Event, bool) {
 	}
 	data := strings.trim_space(line[5:])
 	if data == "[DONE]" {
+		for call, i in impl.call_meta {
+			if len(call.id) == 0 || len(call.name) == 0 {
+				return stream_error(impl, "incomplete provider tool call"), true
+			}
+			for previous in impl.call_meta[:i] {
+				if previous.id == call.id {
+					return stream_error(impl, "duplicate provider tool-call id"), true
+				}
+			}
+		}
 		finalize_partial(impl)
 		if impl.reason == .None {
 			impl.reason = .Stop
@@ -345,8 +563,9 @@ handle_sse_line :: proc(impl: ^OpenAI_Stream, line: string) -> (Event, bool) {
 
 	value, perr := json.parse_string(data, .JSON, false, impl.allocator)
 	if perr != nil {
-		return Event{kind = .Error, text = "malformed SSE chunk", reason = .Error}, true
+		return stream_error(impl, "malformed SSE chunk"), true
 	}
+	defer json.destroy_value(value, impl.allocator)
 	obj, is_obj := value.(json.Object)
 	if !is_obj {
 		return {}, false
@@ -354,9 +573,27 @@ handle_sse_line :: proc(impl: ^OpenAI_Stream, line: string) -> (Event, bool) {
 
 	if usage_v, has := obj["usage"]; has {
 		if usage_obj, uok := usage_v.(json.Object); uok {
-			impl.usage.input = json_int(usage_obj["prompt_tokens"])
-			impl.usage.output = json_int(usage_obj["completion_tokens"])
-			impl.usage.total = json_int(usage_obj["total_tokens"])
+			input, has_input := usage_token_count(usage_obj["prompt_tokens"])
+			output, has_output := usage_token_count(usage_obj["completion_tokens"])
+			total, has_total := usage_token_count(usage_obj["total_tokens"])
+			impl.usage.input = input
+			impl.usage.output = output
+			impl.usage.total = total
+			impl.usage.complete = has_input && has_output && has_total
+			if cost, has := usage_obj["cost"]; has {
+				#partial switch n in cost {
+				case json.Float:
+					if n >= 0 && n <= 1_000_000 {
+						impl.usage.cost_usd = f64(n)
+						impl.usage.cost_reported = true
+					}
+				case json.Integer:
+					if n >= 0 && n <= 1_000_000 {
+						impl.usage.cost_usd = f64(n)
+						impl.usage.cost_reported = true
+					}
+				}
+			}
 		}
 	}
 
@@ -366,11 +603,7 @@ handle_sse_line :: proc(impl: ^OpenAI_Stream, line: string) -> (Event, bool) {
 			if s, sok := err_obj["message"].(json.String); sok {
 				msg = string(s)
 			}
-			return Event {
-				kind = .Error,
-				text = strings.clone(msg, impl.allocator),
-				reason = .Error,
-			}, true
+			return stream_error(impl, strings.clone(msg, impl.allocator)), true
 		}
 	}
 
@@ -404,40 +637,63 @@ handle_sse_line :: proc(impl: ^OpenAI_Stream, line: string) -> (Event, bool) {
 
 	if cv, has := delta["content"]; has {
 		if s, sok := cv.(json.String); sok && len(s) > 0 {
-			b := strings.builder_make(impl.allocator)
-			strings.write_string(&b, impl.partial.text)
-			strings.write_string(&b, string(s))
-			impl.partial.text = strings.to_string(b)
-			return Event {
-				kind = .Text_Delta,
-				text = string(s),
-				partial = &impl.partial,
-			}, true
+			if len(impl.partial.text) == 0 {
+				impl.text_buf = strings.builder_make(impl.allocator)
+			}
+			strings.write_string(&impl.text_buf, string(s))
+			impl.partial.text = strings.to_string(impl.text_buf)
+			queue_delta(impl, .Text_Delta, string(s))
 		}
 	}
 
 	if rv, has := delta["reasoning"]; has {
 		if s, sok := rv.(json.String); sok && len(s) > 0 {
-			b := strings.builder_make(impl.allocator)
-			strings.write_string(&b, impl.partial.thinking)
-			strings.write_string(&b, string(s))
-			impl.partial.thinking = strings.to_string(b)
-			return Event {
-				kind = .Thinking_Delta,
-				text = string(s),
-				partial = &impl.partial,
-			}, true
+			if len(impl.partial.thinking) == 0 {
+				impl.thinking_buf = strings.builder_make(impl.allocator)
+			}
+			strings.write_string(&impl.thinking_buf, string(s))
+			impl.partial.thinking = strings.to_string(impl.thinking_buf)
+			queue_delta(impl, .Thinking_Delta, string(s))
+		}
+	}
+	if rv, has := delta["reasoning_content"]; has {
+		if _, has_reasoning := delta["reasoning"]; !has_reasoning {
+			if s, sok := rv.(json.String); sok && len(s) > 0 {
+				if len(impl.partial.thinking) == 0 {
+					impl.thinking_buf = strings.builder_make(impl.allocator)
+				}
+				strings.write_string(&impl.thinking_buf, string(s))
+				impl.partial.thinking = strings.to_string(impl.thinking_buf)
+				queue_delta(impl, .Thinking_Delta, string(s))
+			}
+		}
+	}
+	if rdv, has := delta["reasoning_details"]; has {
+		if details, aok := rdv.(json.Array); aok {
+			for detail in details {
+				text, uerr := json.unparse(detail, {}, impl.allocator)
+				if uerr != nil {
+					return stream_error(impl, "malformed reasoning details"), true
+				}
+				append(&impl.reasoning_details, text)
+			}
 		}
 	}
 
 	if tcv, has := delta["tool_calls"]; has {
 		if arr, aok := tcv.(json.Array); aok {
+			if len(arr) > MAX_TOOL_CALLS {
+				return stream_error(impl, "provider tool-call count exceeded limit"), true
+			}
 			for item in arr {
 				tc, tok := item.(json.Object)
 				if !tok {
 					continue
 				}
-				idx := json_int(tc["index"])
+				idx, valid_index := tool_call_index(tc["index"])
+				if !valid_index {
+					return stream_error(impl, "invalid provider tool-call index"), true
+				}
 				for len(impl.call_meta) <= idx {
 					append(&impl.call_meta, Tool_Call{})
 					append(&impl.arg_bufs, strings.builder_make(impl.allocator))
@@ -458,11 +714,7 @@ handle_sse_line :: proc(impl: ^OpenAI_Stream, line: string) -> (Event, bool) {
 						if av, has := fn["arguments"]; has {
 							if s, sok := av.(json.String); sok {
 								strings.write_string(&impl.arg_bufs[idx], string(s))
-								return Event {
-									kind = .Tool_Call_Delta,
-									text = string(s),
-									partial = &impl.partial,
-								}, true
+								queue_delta(impl, .Tool_Call_Delta, string(s))
 							}
 						}
 					}
@@ -471,7 +723,35 @@ handle_sse_line :: proc(impl: ^OpenAI_Stream, line: string) -> (Event, bool) {
 		}
 	}
 
-	return {}, false
+	return next_pending(impl)
+}
+
+tool_call_index :: proc(value: json.Value) -> (int, bool) {
+	#partial switch n in value {
+	case json.Integer:
+		if n >= 0 && n < MAX_TOOL_CALLS {
+			return int(n), true
+		}
+	case json.Float:
+		if n >= 0 && n < MAX_TOOL_CALLS && json.Float(int(n)) == n {
+			return int(n), true
+		}
+	}
+	return 0, false
+}
+
+usage_token_count :: proc(value: json.Value) -> (int, bool) {
+	#partial switch n in value {
+	case json.Integer:
+		if n >= 0 && n <= 1_000_000_000 {
+			return int(n), true
+		}
+	case json.Float:
+		if n >= 0 && n <= 1_000_000_000 && json.Float(int(n)) == n {
+			return int(n), true
+		}
+	}
+	return 0, false
 }
 
 json_int :: proc(v: json.Value) -> int {
