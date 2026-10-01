@@ -248,6 +248,7 @@ stream_assistant :: proc(
 					ctx.messages[idx].usage = ev.partial.usage
 				}
 				ctx.messages[idx].stop_reason = ev.reason == .Aborted ? .Aborted : .Error
+				ctx.messages[idx].tool_calls = nil
 				ctx.messages[idx].text = ev.text
 				if !started {
 					emit(Event_Message_Start{message = &ctx.messages[idx]}, emit_userdata)

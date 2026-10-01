@@ -39,8 +39,14 @@ fake_next :: proc(s: ^ai.Stream) -> (ai.Event, bool) {
 		if len(fs.msg.text) > 0 {
 			return ai.Event{kind = .Text_Delta, text = fs.msg.text, partial = &fs.msg}, true
 		}
+		if len(fs.msg.tool_calls) > 0 {
+			return ai.Event{kind = .Tool_Call_Delta, partial = &fs.msg}, true
+		}
 		return fake_next(s) // no text → jump straight to Done
 	case 2:
+		if fs.msg.stop_reason == .Error || fs.msg.stop_reason == .Aborted {
+			return ai.Event{kind = .Error, text = fs.msg.text, reason = fs.msg.stop_reason, partial = &fs.msg}, true
+		}
 		return ai.Event {
 			kind    = .Done,
 			reason  = fs.msg.stop_reason,
@@ -241,4 +247,41 @@ test_abort :: proc(t: ^testing.T) {
 
 	err := run(ctx, cfg, {{role = .User, text = "go"}}, noop_emit, nil, &cancel, context.temp_allocator)
 	testing.expect_value(t, err, Error.Aborted)
+}
+
+@(test)
+test_failed_tool_stream_followup :: proc(t: ^testing.T) {
+	reasons := []ai.Stop_Reason{.Error, .Aborted}
+	for reason in reasons {
+		usage := ai.Usage{input = 19, output = 7, total = 26, cost_usd = 0.01, cost_reported = true}
+		f := new_rig([]ai.Message{
+			{role = .Assistant, tool_calls = {{id = "complete", name = "fake", arguments = `{}`}}, stop_reason = .Tool_Calls},
+			{role = .Assistant, thinking = "partial trace", tool_calls = {{id = "unfinished", name = "fake", arguments = `{"query":`}}, usage = usage, stop_reason = reason},
+			{role = .Assistant, text = "recovered", stop_reason = .Stop},
+		}, context.temp_allocator)
+		ctx, cfg := rig_ctx(f, context.temp_allocator)
+		cancel := ai.Cancellation{}
+
+		err := run(ctx, cfg, {{role = .User, text = "go"}}, noop_emit, nil, &cancel, context.temp_allocator)
+		testing.expect_value(t, err, reason == .Aborted ? Error.Aborted : Error.Stream_Failed)
+		testing.expect_value(t, len(f.tools_ran), 1)
+		testing.expect_value(t, f.tools_ran[0], "complete")
+		failed := ctx.messages[len(ctx.messages) - 1]
+		testing.expect_value(t, failed.stop_reason, reason)
+		testing.expect_value(t, len(failed.tool_calls), 0)
+		testing.expect_value(t, failed.thinking, "partial trace")
+		testing.expect_value(t, failed.usage, usage)
+
+		err = run(ctx, cfg, {{role = .User, text = "try again"}}, noop_emit, nil, &cancel, context.temp_allocator)
+		testing.expect_value(t, err, Error.None)
+		testing.expect_value(t, len(f.tools_ran), 1)
+		testing.expect_value(t, len(f.contexts), 3)
+		request := f.contexts[2]
+		testing.expect_value(t, len(request[1].tool_calls), 1)
+		testing.expect_value(t, request[1].tool_calls[0].id, "complete")
+		testing.expect_value(t, request[2].role, ai.Role.Tool)
+		testing.expect_value(t, request[2].tool_call_id, "complete")
+		testing.expect_value(t, request[2].text, "fake-out")
+		testing.expect_value(t, len(request[3].tool_calls), 0)
+	}
 }
