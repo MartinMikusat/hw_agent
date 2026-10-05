@@ -2,7 +2,8 @@ package serve
 
 // Two clients on one daemon, scripted stream: A creates and prompts; B lists,
 // attaches mid-run (snapshot has A's prompt, running=true), steers, and both
-// see the steered turn live.
+// see the steered turn live. A reads the whole run before B reads anything, so
+// B's unread backlog must not stall A.
 
 import "base:runtime"
 import "core:encoding/json"
@@ -48,7 +49,10 @@ stub_stream :: proc(model: ai.Model, ctx: ai.Context, api_key: string, cancel: ^
 	n := sync.atomic_add(&g.calls, 1) + 1
 	if n == 1 { sync.sema_wait(&g.release) }
 	st := new(Stub_Stream, allocator)
-	st.msg = ai.Message{role = .Assistant, text = fmt.aprintf("reply %d", n, allocator = allocator), stop_reason = .Stop}
+	// Padded past a socket buffer so a client that is not reading would stall a
+	// blocking fan-out (each update and end event repeats the text).
+	text := fmt.aprintf("reply %d %s", n, strings.repeat("x", 256 * 1024, allocator), allocator = allocator)
+	st.msg = ai.Message{role = .Assistant, text = text, stop_reason = .Stop}
 	return ai.Stream{data = st, next = stub_next, result = stub_result, close = stub_close}, nil
 }
 
@@ -165,9 +169,9 @@ test_two_clients_share_session :: proc(t: ^testing.T) {
 			testing.expect_value(t, string(end["session"].(json.String)), id)
 			append(&texts, string(end["text"].(json.String)))
 		}
-		testing.expect_value(t, texts[0], "reply 1")
+		testing.expect(t, strings.has_prefix(texts[0], "reply 1 "))
 		testing.expect_value(t, texts[1], "mid-run")
-		testing.expect_value(t, texts[2], "reply 2")
+		testing.expect(t, strings.has_prefix(texts[2], "reply 2 "))
 	}
 
 	expect_type(&a, "ready")

@@ -18,9 +18,11 @@
 // so an attaching client sees each message exactly once: in the snapshot or
 // live. Socket mode 0600 in a 0700 directory is the access control.
 //
-// ponytail: live sessions stay resident and a slow client stalls its
-// sessions' fan-out; add eviction and per-connection outbound queues when
-// session counts or clients grow.
+// Each connection has an outbound queue drained by its own writer thread, so a
+// client that stops reading never stalls a session's fan-out; one that falls
+// MAX_OUTBOUND_BYTES behind is disconnected.
+//
+// ponytail: live sessions stay resident; add eviction when session counts grow.
 #+feature dynamic-literals
 package serve
 
@@ -62,10 +64,20 @@ Daemon :: struct {
 }
 
 Conn :: struct {
-	fd:       posix.FD,
-	write_mu: sync.Mutex,
-	dead:     bool, // under write_mu
+	fd:        posix.FD,
+	allocator: mem.Allocator,
+	writer:    ^thread.Thread,
+	mu:        sync.Mutex,
+	cond:      sync.Cond,
+	queue:     [dynamic][]u8, // owned line copies, under mu
+	queued:    int,           // bytes in queue, under mu
+	dead:      bool,          // under mu: send failed or client fell too far behind
+	closed:    bool,          // under mu: reader finished; writer drops the rest and exits
 }
+
+// Message updates repeat the whole text so far, so a stalled client's backlog grows
+// fast; past this it is dropped rather than buffered without bound.
+MAX_OUTBOUND_BYTES :: 16 * 1024 * 1024
 
 Live_Session :: struct {
 	id:      string,
@@ -142,6 +154,9 @@ run :: proc(d: ^Daemon) {
 		}
 		c := new(Conn, d.allocator)
 		c.fd = fd
+		c.allocator = d.allocator
+		c.queue = make([dynamic][]u8, 0, 64, d.allocator)
+		c.writer = thread.create_and_start_with_data(c, conn_writer)
 		args := new(Conn_Args, d.allocator)
 		args^ = {d, c}
 		thread.create_and_start_with_data(args, conn_main, self_cleanup = true)
@@ -227,8 +242,59 @@ conn_main :: proc(data: rawptr) {
 			unsubscribe(ls, c)
 		}
 	}
+	sync.mutex_lock(&c.mu)
+	c.closed = true
+	sync.cond_signal(&c.cond)
+	sync.mutex_unlock(&c.mu)
+	thread.join(c.writer)
+	thread.destroy(c.writer)
 	posix.close(c.fd)
+	delete(c.queue)
 	free(c, d.allocator)
+}
+
+@(private)
+conn_writer :: proc(data: rawptr) {
+	c := cast(^Conn)data
+	batch := make([dynamic][]u8, 0, 64, c.allocator)
+	defer delete(batch)
+	for {
+		sync.mutex_lock(&c.mu)
+		for len(c.queue) == 0 && !c.closed {
+			sync.cond_wait(&c.cond, &c.mu)
+		}
+		batch, c.queue = c.queue, batch
+		c.queued = 0
+		skip := c.dead || c.closed
+		finished := c.closed
+		sync.mutex_unlock(&c.mu)
+		for line in batch {
+			if !skip && !send_all(c.fd, line) {
+				skip = true
+				sync.mutex_lock(&c.mu)
+				c.dead = true
+				sync.mutex_unlock(&c.mu)
+				posix.shutdown(c.fd, .RDWR) // wakes the reader so it unsubscribes
+			}
+			delete(line, c.allocator)
+		}
+		clear(&batch)
+		if finished { return }
+	}
+}
+
+@(private)
+send_all :: proc(fd: posix.FD, line: []u8) -> bool {
+	rest := line
+	for len(rest) > 0 {
+		n := posix.send(fd, raw_data(rest), len(rest), {})
+		if n < 0 {
+			if posix.errno() == .EINTR { continue }
+			return false
+		}
+		rest = rest[n:]
+	}
+	return true
 }
 
 @(private)
@@ -502,22 +568,24 @@ conn_write_proc :: proc(line: []u8, userdata: rawptr) {
 	conn_write(cast(^Conn)userdata, line)
 }
 
-// A failed send marks the connection dead; its reader thread cleans it up.
+// conn_write queues one line for the connection's writer and never blocks on
+// the client.
 @(private)
 conn_write :: proc(c: ^Conn, line: []u8) {
-	sync.mutex_lock(&c.write_mu)
-	defer sync.mutex_unlock(&c.write_mu)
-	rest := line
-	for len(rest) > 0 && !c.dead {
-		n := posix.send(c.fd, raw_data(rest), len(rest), {})
-		if n < 0 {
-			if posix.errno() == .EINTR { continue }
-			c.dead = true
-			posix.shutdown(c.fd, .RDWR) // wakes the reader so it unsubscribes
-			return
-		}
-		rest = rest[n:]
+	sync.mutex_lock(&c.mu)
+	defer sync.mutex_unlock(&c.mu)
+	if c.dead || c.closed { return }
+	if c.queued + len(line) > MAX_OUTBOUND_BYTES {
+		c.dead = true
+		posix.shutdown(c.fd, .RDWR)
+		sync.cond_signal(&c.cond)
+		return
 	}
+	copy_line := make([]u8, len(line), c.allocator)
+	copy(copy_line, line)
+	append(&c.queue, copy_line)
+	c.queued += len(line)
+	sync.cond_signal(&c.cond)
 }
 
 valid_id :: proc(id: string) -> bool {
