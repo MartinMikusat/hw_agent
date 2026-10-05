@@ -5,6 +5,7 @@ package main
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "core:sys/posix"
 
 import "agent"
 import "keychain"
@@ -43,14 +44,8 @@ plist_path :: proc() -> string {
 }
 
 install :: proc(model_id: string) -> int {
-	key := os.get_env(API_KEY_ENV, context.allocator)
-	if len(key) > 0 {
-		if status := keychain.write(KEYCHAIN_ACCOUNT, key); status != 0 {
-			fmt.eprintfln("Keychain write failed: OSStatus %d", status)
-			return 1
-		}
-	} else if existing, _ := keychain.read(KEYCHAIN_ACCOUNT); len(existing) == 0 {
-		fmt.eprintln("set OPENROUTER_API_KEY so -install can store it in the Keychain")
+	if existing, _ := keychain.read(KEYCHAIN_ACCOUNT); len(existing) == 0 {
+		fmt.eprintln("no key in the Keychain: run hw_agent -login first")
 		return 1
 	}
 
@@ -87,6 +82,36 @@ install :: proc(model_id: string) -> int {
 	}
 	if !launchctl("bootstrap", path) { return 1 }
 	fmt.printfln("installed %s → %s -serve", path, exe)
+	return 0
+}
+
+// login reads the key from the terminal with echo off and stores it.
+login :: proc() -> int {
+	stdin := posix.FD(0)
+	saved: posix.termios
+	is_tty := posix.tcgetattr(stdin, &saved) == .OK
+	if is_tty {
+		quiet := saved
+		quiet.c_lflag -= {.ECHO}
+		posix.tcsetattr(stdin, .TCSAFLUSH, &quiet)
+	}
+	fmt.eprint("OpenRouter API key: ")
+	buf: [1024]u8
+	n, _ := os.read(os.stdin, buf[:])
+	if is_tty {
+		posix.tcsetattr(stdin, .TCSAFLUSH, &saved)
+		fmt.eprintln()
+	}
+	key := strings.trim_space(string(buf[:max(n, 0)]))
+	if len(key) == 0 {
+		fmt.eprintln("no key entered")
+		return 1
+	}
+	if status := keychain.write(KEYCHAIN_ACCOUNT, key); status != 0 {
+		fmt.eprintfln("Keychain write failed: OSStatus %d", status)
+		return 1
+	}
+	fmt.eprintln("stored in the Keychain (service hw_agent, account openrouter)")
 	return 0
 }
 

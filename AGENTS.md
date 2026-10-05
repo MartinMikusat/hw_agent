@@ -13,15 +13,16 @@ pi-style compaction, JSONL stdio RPC front-end, and a shared socket daemon
 - `./build/hw_agent -rpc [-model=<id>] [-session=<path>]` — JSONL stdio mode
 - `./build/hw_agent -serve [-model=<id>]` — shared daemon on
   `~/Library/Application Support/hw_agent/agent.sock`; protocol in `serve/serve.odin`
+- `./build/hw_agent -login` — prompt for the OpenRouter key (hidden) and store it
+  in the Keychain (service `hw_agent`, account `openrouter`); every mode reads it
+  when `OPENROUTER_API_KEY` is unset
 - `./build/hw_agent -install [-model=<id>]` / `-uninstall` — LaunchAgent
-  `com.halwayland.hw_agent` running `-serve`; `-install` stores
-  `OPENROUTER_API_KEY` in the Keychain (service `hw_agent`, account `openrouter`),
-  which `-serve` reads when the env var is unset
+  `com.halwayland.hw_agent` running `-serve`; requires a stored key
 
 ## Testing
 
 Default model is `deepseek/deepseek-v4.1-flash` ($0.15/M in, 1M ctx); live
-verification runs use it. Auth: `OPENROUTER_API_KEY`.
+verification runs use it. Auth: Keychain via `-login`, or `OPENROUTER_API_KEY`.
 
 `HW_DEBUG=1` dumps raw SSE lines to stderr.
 

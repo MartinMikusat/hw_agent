@@ -27,7 +27,8 @@ Be concise.`
 USAGE :: `usage: hw_agent "<prompt>" [-model=<id>] [-session=<path>]
        hw_agent -rpc [-model=<id>] [-session=<path>]
        hw_agent -serve [-model=<id>]       shared daemon on the agent socket
-       hw_agent -install [-model=<id>]     LaunchAgent for -serve + Keychain key
+       hw_agent -login                     store the OpenRouter key in the Keychain
+       hw_agent -install [-model=<id>]     LaunchAgent for -serve
        hw_agent -uninstall`
 
 API_KEY_ENV :: "OPENROUTER_API_KEY"
@@ -41,7 +42,7 @@ main :: proc() {
 	for arg in os.args[1:] {
 		if arg == "-rpc" {
 			rpc_mode = true
-		} else if arg == "-serve" || arg == "-install" || arg == "-uninstall" {
+		} else if arg == "-serve" || arg == "-install" || arg == "-uninstall" || arg == "-login" {
 			mode = arg
 		} else if strings.has_prefix(arg, "-model=") {
 			model_id = arg[7:]
@@ -58,6 +59,8 @@ main :: proc() {
 	switch mode {
 	case "-install":
 		os.exit(install(model_id))
+	case "-login":
+		os.exit(login())
 	case "-uninstall":
 		os.exit(uninstall())
 	}
@@ -67,11 +70,11 @@ main :: proc() {
 	}
 
 	api_key := os.get_env(API_KEY_ENV, context.allocator)
-	if len(api_key) == 0 && mode == "-serve" {
+	if len(api_key) == 0 {
 		api_key, _ = keychain.read(KEYCHAIN_ACCOUNT)
 	}
 	if len(api_key) == 0 {
-		fmt.eprintln("no OpenRouter API key: set OPENROUTER_API_KEY (or run -install to store it in the Keychain)")
+		fmt.eprintln("no OpenRouter API key: run hw_agent -login (or set OPENROUTER_API_KEY)")
 		os.exit(1)
 	}
 
