@@ -17,8 +17,8 @@ import "rpc"
 import "session"
 import "tools"
 
-DEFAULT_MODEL :: "anthropic/claude-haiku-4.5"
-DEFAULT_CONTEXT_WINDOW :: 200_000
+DEFAULT_MODEL :: "deepseek/deepseek-v4.1-flash"
+DEFAULT_CONTEXT_WINDOW :: 1_000_000
 
 SYSTEM_PROMPT :: `You are a coding agent running inside hw_agent, a minimal harness.
 Use the bash tool to inspect the environment and complete the user's task.

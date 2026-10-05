@@ -20,10 +20,8 @@ pi-style compaction, JSONL stdio RPC front-end, and a shared socket daemon
 
 ## Testing
 
-Live verification runs must use a cheap model — pass
-`-model=deepseek/deepseek-v4.1-flash` ($0.15/M in, 1M ctx). Default model
-(`anthropic/claude-haiku-4.5`) is for real use only. Auth:
-`OPENROUTER_API_KEY`.
+Default model is `deepseek/deepseek-v4.1-flash` ($0.15/M in, 1M ctx); live
+verification runs use it. Auth: `OPENROUTER_API_KEY`.
 
 `HW_DEBUG=1` dumps raw SSE lines to stderr.
 
