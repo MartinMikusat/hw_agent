@@ -32,6 +32,10 @@ Project instructions (`instructions/`) go into every session's system prompt:
 to the session's cwd, 32 KB each; `created`/`snapshot` list the files loaded.
 Read when a session starts or resumes, not live.
 
+`bash` runs each command in its own process group (120 s default timeout, `timeout`
+argument up to 3600): abort or timeout stops the whole group, and processes left
+running when bash exits are stopped too.
+
 Daemon sessions each have a working directory (`create` takes `cwd`, default
 the daemon's); tools and the fff index use it. Bump `FFF_REVISION` in
 `scripts/build_fff.sh` to follow a new fff-mcp release.

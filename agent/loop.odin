@@ -410,9 +410,8 @@ execute_tool_calls :: proc(
 			thread.run_with_data(&job, tool_worker)
 		}
 		sync.wait_group_wait(&wg)
-		// ponytail: cancel only gates dispatch — a running tool thread is not
-		// interrupted mid-execute; bash kills its child via cancel-aware exec
-		// when that lands.
+		// ponytail: the loop cannot interrupt a running tool thread; a tool must
+		// watch cancel itself (bash does, and stops its process group).
 	} else {
 		for &job in jobs {
 			emit(Event_Tool_Start{id = job.call.id, name = job.call.name, arguments = job.call.arguments}, emit_userdata)
