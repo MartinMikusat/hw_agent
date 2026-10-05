@@ -7,7 +7,8 @@ pi-style compaction, JSONL stdio RPC front-end, and a shared socket daemon
 ## Commands
 
 - `./test.sh` — build and run every package test
-- `hw-odin build . -out:build/hw_agent` — build
+- `./build.sh [debug|release]` — build `build/hw_agent` (debug) or
+  `build/hw_agent-release` (embeds the Info.plist the updater pins)
 - `hw-odin test <pkg>/` — one package test (`ai`, `agent`, `session`, `compact`, `rpc`, `serve`)
 - `./build/hw_agent "<prompt>" [-model=<id>] [-session=<path>]` — print mode
 - `./build/hw_agent -rpc [-model=<id>] [-session=<path>]` — JSONL stdio mode
@@ -18,6 +19,17 @@ pi-style compaction, JSONL stdio RPC front-end, and a shared socket daemon
   when `OPENROUTER_API_KEY` is unset
 - `./build/hw_agent -install [-model=<id>]` / `-uninstall` — LaunchAgent
   `com.halwayland.hw_agent` running `-serve`; requires a stored key
+
+## Release and install
+
+Releases ship a bare signed executable through `hw_odin_native_update` (pinned in
+`dependencies.lock`); the installed daemon updates itself hourly, applying only
+when no session is running, then exits so launchd restarts it.
+
+- `python3 scripts/release_macos.py build <x.y.z> --notary-profile delta-support-native`
+  then `python3 scripts/release_macos.py publish dist.noindex/<x.y.z>`
+- First install: download `hw_agent-<x.y.z>.zip` from the latest release,
+  `ditto -x -k <zip> ~/.local/bin`, then `hw_agent -login` and `hw_agent -install`.
 
 ## Testing
 

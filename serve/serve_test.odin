@@ -154,6 +154,7 @@ test_two_clients_share_session :: proc(t: ^testing.T) {
 
 	send_line(&b, fmt.tprintf(`{{"cmd":"prompt","session":"%s","text":"mid-run"}}`, id))
 	time.sleep(50 * time.Millisecond) // let B's reader queue the steer before the turn ends
+	testing.expect(t, !close_if_idle(d), "an update must not interrupt a running session")
 	sync.sema_post(&gate.release)
 
 	for c in ([]^Client{&a, &b}) {
@@ -168,6 +169,13 @@ test_two_clients_share_session :: proc(t: ^testing.T) {
 		testing.expect_value(t, texts[1], "mid-run")
 		testing.expect_value(t, texts[2], "reply 2")
 	}
+
+	expect_type(&a, "ready")
+	testing.expect(t, close_if_idle(d))
+	send_line(&a, `{"cmd":"create"}`)
+	refused := expect_type(&a, "error")
+	testing.expect(t, refused != nil && strings.contains(string(refused["text"].(json.String)), "restarting"))
+	reopen(d)
 
 	send_line(&b, `{"cmd":"attach","session":"../../etc"}`)
 	bad := expect_type(&b, "error")

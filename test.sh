@@ -2,7 +2,7 @@
 
 set -eu
 
-hw-odin build . -out:build/hw_agent
+"$(dirname -- "$0")/build.sh"
 for package in ai agent session compact rpc serve; do
     hw-odin test "$package/"
 done

@@ -34,7 +34,8 @@ serve_daemon :: proc(base: agent.Loop_Config) -> int {
 		fmt.eprintfln("hw_agent -serve: %v (%s)", err, cfg.socket_path)
 		return 1
 	}
-	fmt.eprintfln("hw_agent -serve: listening on %s", cfg.socket_path)
+	fmt.eprintfln("hw_agent %s -serve: listening on %s", APP_VERSION, cfg.socket_path)
+	update_start(d)
 	serve.run(d)
 	return 0
 }
@@ -82,6 +83,9 @@ install :: proc(model_id: string) -> int {
 	}
 	if !launchctl("bootstrap", path) { return 1 }
 	fmt.printfln("installed %s → %s -serve", path, exe)
+	if APP_VERSION == "dev" {
+		fmt.eprintln("note: this is a dev build; it never updates itself. Install a release into ~/.local/bin for automatic updates.")
+	}
 	return 0
 }
 

@@ -1,0 +1,11 @@
+{
+  "schema": 1,
+  "repositories": [
+    {
+      "name": "hw_odin_native_update",
+      "path": "../odin_libraries/hw_odin_native_update",
+      "url": "https://github.com/MartinMikusat/hw_odin_native_update.git",
+      "revision": "59e034d8b4ec094a741d67e5e45d311fe0d03b0a"
+    }
+  ]
+}

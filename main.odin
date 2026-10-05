@@ -29,7 +29,8 @@ USAGE :: `usage: hw_agent "<prompt>" [-model=<id>] [-session=<path>]
        hw_agent -serve [-model=<id>]       shared daemon on the agent socket
        hw_agent -login                     store the OpenRouter key in the Keychain
        hw_agent -install [-model=<id>]     LaunchAgent for -serve
-       hw_agent -uninstall`
+       hw_agent -uninstall
+       hw_agent -version`
 
 API_KEY_ENV :: "OPENROUTER_API_KEY"
 
@@ -40,7 +41,10 @@ main :: proc() {
 	rpc_mode := false
 	mode := ""
 	for arg in os.args[1:] {
-		if arg == "-rpc" {
+		if arg == "-version" {
+			fmt.println(APP_VERSION)
+			return
+		} else if arg == "-rpc" {
 			rpc_mode = true
 		} else if arg == "-serve" || arg == "-install" || arg == "-uninstall" || arg == "-login" {
 			mode = arg

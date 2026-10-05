@@ -34,6 +34,7 @@ import "core:mem/virtual"
 import "core:os"
 import "core:strings"
 import "core:sync"
+import "core:sync/chan"
 import "core:sys/posix"
 import "core:thread"
 
@@ -56,6 +57,7 @@ Daemon :: struct {
 	listen_fd: posix.FD,
 	mu:        sync.Mutex,
 	sessions:  map[string]^Live_Session,
+	closing:   bool, // under mu: refusing new work while an update installs
 	allocator: mem.Allocator, // thread-safe; owns everything the daemon keeps
 }
 
@@ -146,6 +148,31 @@ run :: proc(d: ^Daemon) {
 	}
 }
 
+// close_if_idle starts refusing new work when no session is running or has a
+// prompt queued, so the caller can replace the executable and exit. reopen undoes it.
+close_if_idle :: proc(d: ^Daemon) -> bool {
+	sync.mutex_lock(&d.mu)
+	defer sync.mutex_unlock(&d.mu)
+	for _, ls in d.sessions {
+		if sync.atomic_load(&ls.srv.running) || chan.len(ls.srv.prompt_ch) > 0 { return false }
+	}
+	d.closing = true
+	return true
+}
+
+reopen :: proc(d: ^Daemon) {
+	sync.mutex_lock(&d.mu)
+	defer sync.mutex_unlock(&d.mu)
+	d.closing = false
+}
+
+@(private)
+is_closing :: proc(d: ^Daemon) -> bool {
+	sync.mutex_lock(&d.mu)
+	defer sync.mutex_unlock(&d.mu)
+	return d.closing
+}
+
 // shutdown stops accepting; live sessions and connections end with the process.
 shutdown :: proc(d: ^Daemon) {
 	posix.shutdown(d.listen_fd, .RDWR)
@@ -214,6 +241,13 @@ handle :: proc(d: ^Daemon, c: ^Conn, v: json.Value) {
 	req := obj["req"]
 	cmd, _ := obj["cmd"].(json.String)
 	id, _ := obj["session"].(json.String)
+	switch cmd {
+	case "create", "prompt", "steer", "follow_up":
+		if is_closing(d) {
+			reply_error(c, req, string(id), "hw_agent is restarting to install an update; retry shortly")
+			return
+		}
+	}
 	switch cmd {
 	case "list":
 		reply_list(d, c, req)
