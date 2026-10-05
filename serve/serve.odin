@@ -8,6 +8,8 @@
 //        {"cmd":"attach","session":id}           → {"type":"snapshot","session":id,"running":bool,"messages":[...]}
 //                                                  then live events
 //        {"cmd":"detach","session":id}
+//        {"cmd":"delete","session":id}           → {"type":"deleted","session":id} to the caller
+//                                                  and every attached client; refused while running
 //        {"cmd":"prompt"|"steer"|"follow_up"|"abort","session":id,"text"?:"..."}
 //                                                  stdio RPC semantics per session
 //   out: every stdio RPC event plus "session":id; failures are
@@ -49,6 +51,7 @@ import "../session"
 Config :: struct {
 	socket_path:   string,
 	sessions_dir:  string,
+	traces_dir:    string, // per-session raw provider traces; "" when tracing is off
 	default_model: string,
 	system_prompt: string,
 	base:          agent.Loop_Config, // per-session copy; model.id is replaced
@@ -351,6 +354,12 @@ handle :: proc(d: ^Daemon, c: ^Conn, v: json.Value) {
 			return
 		}
 		rpc.handle_command(&ls.srv, v)
+	case "delete":
+		if err := delete_session(d, string(id), c); err != "" {
+			reply_error(c, req, string(id), err)
+			return
+		}
+		reply(c, req, "deleted", map[string]json.Value{"session" = strings.clone(string(id), context.temp_allocator)})
 	case "quit":
 		reply_error(c, req, "", "quit is stdio-only; stop the daemon with launchctl")
 	case:
@@ -368,6 +377,45 @@ live :: proc(d: ^Daemon, id: string) -> (^Live_Session, string) {
 	path := session_path(d, id, context.temp_allocator)
 	if !os.exists(path) { return nil, "no such session" }
 	return start_session(d, id, path, "")
+}
+
+// delete_session removes a session's log and traces. A live session is stopped
+// first and its subscribers are told; a running one is refused.
+//
+// ponytail: a deleted live session's memory is not reclaimed (its loop thread
+// may still be returning); bounded by deletes per daemon lifetime.
+@(private)
+delete_session :: proc(d: ^Daemon, id: string, caller: ^Conn) -> string {
+	if !valid_id(id) { return "invalid session id" }
+	sync.mutex_lock(&d.mu)
+	defer sync.mutex_unlock(&d.mu)
+	path := session_path(d, id, context.temp_allocator)
+	ls, live := d.sessions[id]
+	if live {
+		if sync.atomic_load(&ls.srv.running) || chan.len(ls.srv.prompt_ch) > 0 {
+			return "session is running; abort it first"
+		}
+	} else if !os.exists(path) {
+		return "no such session"
+	}
+	if err := os.remove(path); err != nil {
+		devlog.failed(devlog.global(), {feature = "session", operation = "delete"}, {reason = "session log could not be removed", detail = id})
+		return "session log could not be removed"
+	}
+	if len(d.cfg.traces_dir) > 0 {
+		os.remove_all(fmt.tprintf("%s/%s", d.cfg.traces_dir, id))
+	}
+	if live {
+		chan.close(ls.srv.prompt_ch) // run_loop returns
+		session.close(ls.sess)
+		delete_key(&d.sessions, id)
+		sync.recursive_mutex_lock(&ls.mu)
+		unsubscribe(ls, caller) // the caller gets the direct reply instead
+		rpc.emit_line(&ls.sink, "deleted", nil)
+		clear(&ls.subs)
+		sync.recursive_mutex_unlock(&ls.mu)
+	}
+	return ""
 }
 
 @(private)
@@ -445,7 +493,7 @@ attach :: proc(ls: ^Live_Session, c: ^Conn, req: json.Value) {
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	sync.recursive_mutex_lock(&ls.mu)
 	defer sync.recursive_mutex_unlock(&ls.mu)
-	messages, err := session.replay(ls.path, context.temp_allocator)
+	messages, _, err := session.replay(ls.path, context.temp_allocator)
 	if err != nil {
 		reply_error(c, req, ls.id, fmt.tprintf("session replay failed: %v", err))
 		return

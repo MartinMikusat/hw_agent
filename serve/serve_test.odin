@@ -181,6 +181,13 @@ test_two_clients_share_session :: proc(t: ^testing.T) {
 	testing.expect(t, refused != nil && strings.contains(string(refused["text"].(json.String)), "restarting"))
 	reopen(d)
 
+	send_line(&a, fmt.tprintf(`{{"cmd":"delete","session":"%s"}}`, id))
+	testing.expect(t, expect_type(&b, "deleted") != nil, "attached clients learn the session is gone")
+	testing.expect(t, expect_type(&a, "deleted") != nil)
+	testing.expect(t, !os.exists(fmt.tprintf("%s/%s.jsonl", cfg.sessions_dir, id)))
+	send_line(&b, fmt.tprintf(`{{"cmd":"attach","session":"%s"}}`, id))
+	testing.expect_value(t, string(expect_type(&b, "error")["text"].(json.String)), "no such session")
+
 	send_line(&b, `{"cmd":"attach","session":"../../etc"}`)
 	bad := expect_type(&b, "error")
 	testing.expect_value(t, string(bad["text"].(json.String)), "invalid session id")

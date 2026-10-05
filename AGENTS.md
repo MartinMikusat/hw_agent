@@ -14,6 +14,9 @@ pi-style compaction, JSONL stdio RPC front-end, and a shared socket daemon
 - `./build/hw_agent -rpc [-model=<id>] [-session=<path>]` — JSONL stdio mode
 - `./build/hw_agent -serve [-model=<id>]` — shared daemon on
   `~/Library/Application Support/hw_agent/agent.sock`; protocol in `serve/serve.odin`
+- `./build/hw_agent -sessions` / `-show=<id>` / `-export=<id> [-json]` /
+  `-rm=<id>` — list, read, export and delete daemon sessions (`-rm` goes
+  through the daemon when it runs; a running session is refused)
 - `./build/hw_agent -login` — prompt for the OpenRouter key (hidden) and store it
   in the Keychain (service `hw_agent`, account `openrouter`); every mode reads it
   when `OPENROUTER_API_KEY` is unset

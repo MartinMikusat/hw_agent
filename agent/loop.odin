@@ -44,6 +44,7 @@ run :: proc(
 
 	for p in prompts {
 		msg := p
+		if msg.timestamp == 0 { msg.timestamp = time.to_unix_seconds(time.now()) }
 		append(&ctx.messages, msg)
 		emit(Event_Message_Start{message = &ctx.messages[len(ctx.messages) - 1]}, emit_userdata)
 		emit(Event_Message_End{message = &ctx.messages[len(ctx.messages) - 1]}, emit_userdata)
@@ -64,6 +65,7 @@ run :: proc(
 			}
 			for p in pending {
 				msg := p
+				if msg.timestamp == 0 { msg.timestamp = time.to_unix_seconds(time.now()) }
 				append(&ctx.messages, msg)
 				emit(Event_Message_Start{message = &ctx.messages[len(ctx.messages) - 1]}, emit_userdata)
 				emit(Event_Message_End{message = &ctx.messages[len(ctx.messages) - 1]}, emit_userdata)

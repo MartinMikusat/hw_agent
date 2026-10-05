@@ -31,6 +31,10 @@ USAGE :: `usage: hw_agent "<prompt>" [-model=<id>] [-session=<path>]
        hw_agent -login                     store the OpenRouter key in the Keychain
        hw_agent -install [-model=<id>]     LaunchAgent for -serve
        hw_agent -uninstall
+       hw_agent -sessions                  list daemon sessions, newest first
+       hw_agent -show=<id|path>            readable transcript
+       hw_agent -export=<id|path> [-json]  full Markdown (or JSON) transcript
+       hw_agent -rm=<id|path>              delete a session and its traces
        hw_agent -version`
 
 API_KEY_ENV :: "OPENROUTER_API_KEY"
@@ -41,14 +45,21 @@ main :: proc() {
 	prompt := ""
 	rpc_mode := false
 	mode := ""
+	target := ""
+	as_json := false
 	for arg in os.args[1:] {
 		if arg == "-version" {
 			fmt.println(APP_VERSION)
 			return
 		} else if arg == "-rpc" {
 			rpc_mode = true
-		} else if arg == "-serve" || arg == "-install" || arg == "-uninstall" || arg == "-login" {
+		} else if arg == "-serve" || arg == "-install" || arg == "-uninstall" || arg == "-login" || arg == "-sessions" {
 			mode = arg
+		} else if strings.has_prefix(arg, "-show=") || strings.has_prefix(arg, "-export=") || strings.has_prefix(arg, "-rm=") {
+			eq := strings.index_byte(arg, '=')
+			mode, target = arg[:eq], arg[eq + 1:]
+		} else if arg == "-json" {
+			as_json = true
 		} else if strings.has_prefix(arg, "-model=") {
 			model_id = arg[7:]
 		} else if strings.has_prefix(arg, "-session=") {
@@ -76,6 +87,14 @@ main :: proc() {
 		exit(login())
 	case "-uninstall":
 		exit(uninstall())
+	case "-sessions":
+		exit(cmd_sessions())
+	case "-show":
+		exit(cmd_show(target))
+	case "-export":
+		exit(cmd_export(target, as_json))
+	case "-rm":
+		exit(cmd_rm(target))
 	}
 	if len(prompt) == 0 && !rpc_mode && mode == "" {
 		fmt.eprintln(USAGE)

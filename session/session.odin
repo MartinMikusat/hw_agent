@@ -81,12 +81,13 @@ open :: proc(path: string, allocator: mem.Allocator) -> (^Session, []agent.Agent
 	return s, messages[:], nil
 }
 
-// Read-only replay of the log at path, for observers of a live session.
-replay :: proc(path: string, allocator: mem.Allocator) -> ([]agent.Agent_Message, os.Error) {
+// Read-only replay of the log at path, for observers of a live session and the
+// transcript commands. model is the header's, "" for logs without one.
+replay :: proc(path: string, allocator: mem.Allocator) -> (messages: []agent.Agent_Message, model: string, err: os.Error) {
 	s := Session{allocator = allocator}
-	messages := make([dynamic]agent.Agent_Message, 0, 64, allocator)
-	err := replay_into(&s, path, &messages)
-	return messages[:], err
+	list := make([dynamic]agent.Agent_Message, 0, 64, allocator)
+	err = replay_into(&s, path, &list)
+	return list[:], s.model, err
 }
 
 @(private)
