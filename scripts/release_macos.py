@@ -12,7 +12,7 @@ spec.loader.exec_module(release)
 release.configure(
     root,
     app_name="hw_agent",
-    bundle_id="com.halwayland.hw_agent",
+    bundle_id="com.halwayland.hw-agent",
     team_id="5242LK8KGW",
     repo="MartinMikusat/hw_agent",
     built_app="build/hw_agent-release",

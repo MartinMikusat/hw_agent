@@ -19,7 +19,7 @@ import "serve"
 UPDATE_VERSION :: #config(HW_UPDATE_VERSION, "")
 UPDATE_FEED_URL :: #config(HW_UPDATE_FEED_URL, "")
 UPDATE_TEAM_ID :: #config(HW_UPDATE_TEAM_ID, "")
-UPDATE_BUNDLE_ID :: "com.halwayland.hw_agent"
+UPDATE_BUNDLE_ID :: "com.halwayland.hw-agent"
 UPDATE_EXECUTABLE :: "hw_agent"
 UPDATE_INTERVAL :: time.Hour
 UPDATE_IDLE_POLL :: 5 * time.Second
