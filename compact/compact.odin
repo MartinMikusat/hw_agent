@@ -15,6 +15,7 @@ import "core:time"
 
 import "../agent"
 import "../ai"
+import "../textutil"
 
 RESERVE_TOKENS :: 16_000  // headroom below the context window
 KEEP_CHARS     :: 80_000  // ~20k tokens of verbatim tail at chars/4
@@ -51,9 +52,6 @@ estimate_tokens :: proc(messages: []agent.Agent_Message) -> int {
 	}
 	for i in last + 1 ..< len(messages) {
 		base += msg_chars(messages[i]) / 4
-	}
-	if last < 0 {
-		return base
 	}
 	return base
 }
@@ -97,52 +95,47 @@ serialize_head :: proc(messages: []agent.Agent_Message, allocator: mem.Allocator
 	for m in messages {
 		switch m.role {
 		case .User:
-			strings.write_string(&out, fmt.tprintf("[User]: %s\n", m.text))
+			fmt.sbprintf(&out, "[User]: %s\n", m.text)
 		case .Assistant:
 			if len(m.text) > 0 {
-				strings.write_string(&out, fmt.tprintf("[Assistant]: %s\n", m.text))
+				fmt.sbprintf(&out, "[Assistant]: %s\n", m.text)
 			}
 			if len(m.thinking) > 0 {
-				t := m.thinking
-				if len(t) > THINK_SNIP {
-					t = fmt.tprintf("%s…", t[:THINK_SNIP])
-				}
-				strings.write_string(&out, fmt.tprintf("[Assistant thinking]: %s\n", t))
+				text, more := snip(m.thinking, THINK_SNIP)
+				fmt.sbprintf(&out, "[Assistant thinking]: %s%s\n", text, more)
 			}
 			for c in m.tool_calls {
-				args := c.arguments
-				if len(args) > SNIP_CHARS {
-					args = fmt.tprintf("%s…", args[:SNIP_CHARS])
-				}
-				strings.write_string(&out, fmt.tprintf("[Assistant tool call]: %s(%s)\n", c.name, args))
+				args, more := snip(c.arguments, SNIP_CHARS)
+				fmt.sbprintf(&out, "[Assistant tool call]: %s(%s%s)\n", c.name, args, more)
 			}
 		case .Tool_Result:
 			label := m.is_error ? "[Tool error]" : "[Tool result]"
-			text := m.text
-			if len(text) > SNIP_CHARS {
-				text = fmt.tprintf("%s…", text[:SNIP_CHARS])
-			}
-			strings.write_string(&out, fmt.tprintf("%s: %s\n", label, text))
+			text, more := snip(m.text, SNIP_CHARS)
+			fmt.sbprintf(&out, "%s: %s%s\n", label, text, more)
 		case .Compaction_Summary:
-			strings.write_string(&out, fmt.tprintf("[Prior summary]: %s\n", m.text))
+			fmt.sbprintf(&out, "[Prior summary]: %s\n", m.text)
 		case .Bash_Execution, .Custom, .Branch_Summary:
-			text := m.text
-			if len(text) > SNIP_CHARS {
-				text = fmt.tprintf("%s…", text[:SNIP_CHARS])
-			}
-			strings.write_string(&out, fmt.tprintf("[Context]: %s\n", text))
+			text, more := snip(m.text, SNIP_CHARS)
+			fmt.sbprintf(&out, "[Context]: %s%s\n", text, more)
 		}
 	}
 	return strings.to_string(out)
 }
 
+// snip cuts text to limit bytes on a character boundary and says whether it did.
+snip :: proc(text: string, limit: int) -> (kept: string, ellipsis: string) {
+	if len(text) <= limit { return text, "" }
+	return textutil.cut(text, limit), "…"
+}
+
 // Deterministic file-op extraction — survives successive compactions without
-// depending on the summarizer's memory.
-file_ops :: proc(messages: []agent.Agent_Message, allocator: mem.Allocator) -> (read, modified: [dynamic]string) {
+// depending on the summarizer's memory. Results are allocated with allocator,
+// parsing scratch with scratch.
+file_ops :: proc(messages: []agent.Agent_Message, allocator, scratch: mem.Allocator) -> (read, modified: [dynamic]string) {
 	read = make([dynamic]string, 0, 8, allocator)
 	modified = make([dynamic]string, 0, 8, allocator)
-	seen_r := make(map[string]bool, allocator = allocator)
-	seen_m := make(map[string]bool, allocator = allocator)
+	seen_r := make(map[string]bool, allocator = scratch)
+	seen_m := make(map[string]bool, allocator = scratch)
 	for m in messages {
 		if m.role != .Assistant {
 			continue
@@ -158,7 +151,7 @@ file_ops :: proc(messages: []agent.Agent_Message, allocator: mem.Allocator) -> (
 			case:
 				continue
 			}
-			v, perr := json.parse_string(c.arguments, .JSON, false, allocator)
+			v, perr := json.parse_string(c.arguments, .JSON, false, scratch)
 			if perr != nil {
 				continue
 			}
@@ -215,10 +208,15 @@ prune :: proc(messages: []agent.Agent_Message, userdata: rawptr) -> []agent.Agen
 
 // The Loop_Config.compact hook. Checks the threshold, summarizes the head,
 // splices [Compaction_Summary] + tail into ctx.messages, and returns the
-// record for the session log. nil = nothing to do or no safe cut.
+// record for the session log. nil = nothing to do, no safe cut, a failed
+// summary, or an abort (which also stops the summary request).
+//
+// ponytail: the messages cut away are not freed (the loop cannot tell heap
+// strings from literals); that is bounded by one conversation per compaction.
 maybe_compact :: proc(
 	ctx: ^agent.Context,
 	cfg: ^agent.Loop_Config,
+	cancel: ^ai.Cancellation,
 	userdata: rawptr,
 ) -> ^agent.Compaction {
 	allocator := context.allocator
@@ -234,16 +232,25 @@ maybe_compact :: proc(
 	started := time.tick_now()
 	devlog.started(devlog.global(), site)
 
-	head_text := serialize_head(ctx.messages[:cut], allocator)
-	prompt := fmt.aprintf(SUMMARY_TEMPLATE, head_text, allocator = allocator)
+	// The summarizer's input, request and stream live in this arena; only the
+	// summary text and the record are kept.
+	arena: mem.Dynamic_Arena
+	mem.dynamic_arena_init(&arena)
+	defer mem.dynamic_arena_destroy(&arena)
+	scratch := mem.dynamic_arena_allocator(&arena)
+
+	head_text := serialize_head(ctx.messages[:cut], scratch)
+	prompt := fmt.aprintf(SUMMARY_TEMPLATE, head_text, allocator = scratch)
 
 	sum_ctx := ai.Context {
 		system_prompt = SUMMARY_SYSTEM,
 		messages = []ai.Message{{role = .User, text = prompt}},
 	}
-	stream, serr := cfg.stream(cfg.model, sum_ctx, cfg.api_key, nil, allocator)
+	stream, serr := cfg.stream(cfg.model, sum_ctx, cfg.api_key, cancel, scratch)
 	if serr != nil {
-		devlog.failed(devlog.global(), site, {reason = "summary request failed; context kept", severity = .Warning, code = i32(serr)})
+		if serr != .Aborted {
+			devlog.failed(devlog.global(), site, {reason = "summary request failed; context kept", severity = .Warning, code = i32(serr)})
+		}
 		return nil
 	}
 	defer stream.close(&stream)
@@ -257,6 +264,9 @@ maybe_compact :: proc(
 			failed = true
 		}
 	}
+	if ai.is_cancelled(cancel) {
+		return nil
+	}
 	if failed {
 		devlog.failed(devlog.global(), site, {reason = "summary request failed; context kept", severity = .Warning})
 		return nil
@@ -268,16 +278,16 @@ maybe_compact :: proc(
 	}
 	devlog.succeeded(devlog.global(), site, metrics = {duration_ms = i64(time.duration_milliseconds(time.tick_since(started)))})
 
-	read, modified := file_ops(ctx.messages[:cut], allocator)
+	read, modified := file_ops(ctx.messages[:cut], allocator, scratch)
 	summary := strings.builder_make(allocator)
 	strings.write_string(&summary, final.text)
 	if len(read) > 0 || len(modified) > 0 {
 		strings.write_string(&summary, "\n\n## File operations\n")
 		if len(read) > 0 {
-			strings.write_string(&summary, fmt.tprintf("Files read: %s\n", strings.join(read[:], ", ", allocator)))
+			fmt.sbprintf(&summary, "Files read: %s\n", strings.join(read[:], ", ", scratch))
 		}
 		if len(modified) > 0 {
-			strings.write_string(&summary, fmt.tprintf("Files modified: %s\n", strings.join(modified[:], ", ", allocator)))
+			fmt.sbprintf(&summary, "Files modified: %s\n", strings.join(modified[:], ", ", scratch))
 		}
 	}
 	summary_text := strings.to_string(summary)

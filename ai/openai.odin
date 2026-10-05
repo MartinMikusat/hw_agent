@@ -76,7 +76,7 @@ response_schema_valid :: proc(source: string) -> bool {
 	if len(source) > 64 * 1024 || !utf8.valid_string(source) {return false}
 	tokenizer := json.make_tokenizer(source, spec = .JSON)
 	depth, started, closed := 0, false, false
-	for iteration in 0..=len(source) {
+	for _ in 0..=len(source) {
 		token, error := json.get_token(&tokenizer)
 		if error == .EOF || token.kind == .EOF {return started && closed && depth == 0}
 		if error != .None || closed || !started && token.kind != .Open_Brace {return false}
@@ -707,7 +707,7 @@ handle_sse_line :: proc(impl: ^OpenAI_Stream, line: string) -> (Event, bool) {
 			impl.usage.output = output
 			impl.usage.total = total
 			impl.usage.complete = has_input && has_output && has_total
-			if cost, has := usage_obj["cost"]; has {
+			if cost, has_cost := usage_obj["cost"]; has_cost {
 				#partial switch n in cost {
 				case json.Float:
 					if n >= 0 && n <= 1_000_000 {
@@ -831,19 +831,19 @@ handle_sse_line :: proc(impl: ^OpenAI_Stream, line: string) -> (Event, bool) {
 					append(&impl.arg_bufs, strings.builder_make(impl.allocator))
 				}
 				meta := &impl.call_meta[idx]
-				if idv, has := tc["id"]; has {
+				if idv, has_id := tc["id"]; has_id {
 					if s, sok := idv.(json.String); sok {
 						meta.id = textutil.clean(string(s), impl.allocator)
 					}
 				}
-				if fnv, has := tc["function"]; has {
+				if fnv, has_function := tc["function"]; has_function {
 					if fn, fok := fnv.(json.Object); fok {
-						if nv, has := fn["name"]; has {
+						if nv, has_name := fn["name"]; has_name {
 							if s, sok := nv.(json.String); sok {
 								meta.name = textutil.clean(string(s), impl.allocator)
 							}
 						}
-						if av, has := fn["arguments"]; has {
+						if av, has_arguments := fn["arguments"]; has_arguments {
 							if s, sok := av.(json.String); sok {
 								text := textutil.scrub(string(s), impl.allocator)
 								strings.write_string(&impl.arg_bufs[idx], text)

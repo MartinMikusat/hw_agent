@@ -50,6 +50,25 @@ convert_to_llm :: proc(messages: []Agent_Message, allocator: mem.Allocator) -> [
 	return out[:]
 }
 
+// own_message copies the strings and slices an assistant message references into
+// allocator, so it can outlive the arena its stream was allocated in.
+own_message :: proc(msg: ^Agent_Message, allocator: mem.Allocator) {
+	msg.text = strings.clone(msg.text, allocator)
+	msg.thinking = strings.clone(msg.thinking, allocator)
+	msg.reasoning_details_json = strings.clone(msg.reasoning_details_json, allocator)
+	if len(msg.tool_calls) > 0 {
+		calls := make([]ai.Tool_Call, len(msg.tool_calls), allocator)
+		for call, i in msg.tool_calls {
+			calls[i] = {
+				id        = strings.clone(call.id, allocator),
+				name      = strings.clone(call.name, allocator),
+				arguments = strings.clone(call.arguments, allocator),
+			}
+		}
+		msg.tool_calls = calls
+	}
+}
+
 assistant_from_wire :: proc(msg: ai.Message, timestamp: i64) -> Agent_Message {
 	return Agent_Message {
 		role = .Assistant,

@@ -154,6 +154,7 @@ serve :: proc(
 run_loop :: proc(srv: ^Server, emit: agent.Emit, emit_userdata: rawptr) {
 	emit_line(srv.sink, "ready", nil)
 	for {
+		runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD() // one run's scratch memory per iteration
 		text, ok := chan.recv(srv.prompt_ch)
 		if !ok { break }
 		// "" is quit's wakeup sentinel — prompts queued before it still run
@@ -176,6 +177,7 @@ run_loop :: proc(srv: ^Server, emit: agent.Emit, emit_userdata: rawptr) {
 // emit_json is the agent.Event sink — one JSONL line per event. userdata is a
 // ^Line_Sink, or nil for stdout.
 emit_json :: proc(event: agent.Event, userdata: rawptr) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	sink := cast(^Line_Sink)userdata
 	#partial switch e in event {
 	case agent.Event_Agent_Start:
@@ -283,19 +285,19 @@ handle_command :: proc(srv: ^Server, v: json.Value) {
 	}
 }
 
-drain_steering :: proc(userdata: rawptr) -> []agent.Agent_Message {
-	return drain(cast(^Server)userdata, &(cast(^Server)userdata).steer_q)
+drain_steering :: proc(userdata: rawptr, allocator: mem.Allocator) -> []agent.Agent_Message {
+	return drain(cast(^Server)userdata, &(cast(^Server)userdata).steer_q, allocator)
 }
 
-drain_follow_up :: proc(userdata: rawptr) -> []agent.Agent_Message {
-	return drain(cast(^Server)userdata, &(cast(^Server)userdata).follow_q)
+drain_follow_up :: proc(userdata: rawptr, allocator: mem.Allocator) -> []agent.Agent_Message {
+	return drain(cast(^Server)userdata, &(cast(^Server)userdata).follow_q, allocator)
 }
 
-drain :: proc(srv: ^Server, q: ^[dynamic]agent.Agent_Message) -> []agent.Agent_Message {
+drain :: proc(srv: ^Server, q: ^[dynamic]agent.Agent_Message, allocator: mem.Allocator) -> []agent.Agent_Message {
 	if sync.mutex_guard(&srv.mu) {
 		defer sync.mutex_unlock(&srv.mu)
 		if len(q^) == 0 { return nil }
-		out := make([]agent.Agent_Message, len(q^), context.allocator)
+		out := make([]agent.Agent_Message, len(q^), allocator)
 		copy(out, q^[:])
 		clear(q)
 		return out
@@ -343,6 +345,7 @@ set_permissions :: proc(srv: ^Server, gate: ^permissions.Gate) {
 // to a client. Block reasons reach the model as the tool result, so they are
 // allocated for the transcript, not the temp allocator.
 permission_hook :: proc(call: ai.Tool_Call, userdata: rawptr) -> (block: bool, reason: string) {
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	srv := cast(^Server)userdata
 	decision := permissions.evaluate(srv.gate, call.name, call.arguments)
 	switch decision.action {
@@ -461,11 +464,12 @@ pending_permission :: proc(srv: ^Server) -> json.Value {
 	sync.mutex_lock(&ap.mu)
 	defer sync.mutex_unlock(&ap.mu)
 	if !ap.active { return nil }
-	return json.Object{
-		"id" = strings.clone(ap.id, context.temp_allocator),
-		"tool" = strings.clone(ap.tool, context.temp_allocator),
-		"target" = strings.clone(ap.target, context.temp_allocator),
-		"arguments" = strings.clone(ap.arguments, context.temp_allocator),
-		"rule" = strings.clone(ap.rule, context.temp_allocator),
-	}
+	scratch := context.temp_allocator
+	fields := make(json.Object, 5, scratch)
+	fields["id"] = strings.clone(ap.id, scratch)
+	fields["tool"] = strings.clone(ap.tool, scratch)
+	fields["target"] = strings.clone(ap.target, scratch)
+	fields["arguments"] = strings.clone(ap.arguments, scratch)
+	fields["rule"] = strings.clone(ap.rule, scratch)
+	return fields
 }

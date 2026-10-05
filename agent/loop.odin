@@ -57,6 +57,7 @@ run :: proc(
 	emit(Event_Turn_Start{}, emit_userdata)
 
 	pending := mark(drain(cfg.get_steering, cfg.userdata, allocator), .Steer)
+	defer if pending != nil { delete(pending, allocator) }
 	turns := 0
 	for {
 		has_more := true
@@ -74,6 +75,7 @@ run :: proc(
 				emit(Event_Message_Start{message = &ctx.messages[len(ctx.messages) - 1]}, emit_userdata)
 				emit(Event_Message_End{message = &ctx.messages[len(ctx.messages) - 1]}, emit_userdata)
 			}
+			delete(pending, allocator)
 			pending = nil
 
 			msg_index, stream_err := stream_assistant(ctx, cfg, emit, emit_userdata, cancel, allocator)
@@ -140,11 +142,18 @@ mark :: proc(messages: []Agent_Message, delivery: Delivery) -> []Agent_Message {
 	return messages
 }
 
-drain :: proc(get: proc(rawptr) -> []Agent_Message, userdata: rawptr, allocator: mem.Allocator) -> []Agent_Message {
+drain :: proc(get: proc(rawptr, mem.Allocator) -> []Agent_Message, userdata: rawptr, allocator: mem.Allocator) -> []Agent_Message {
 	if get == nil {
 		return nil
 	}
-	return get(userdata)
+	return get(userdata, allocator)
+}
+
+// Where one assistant response is in progress across attempts.
+Turn_State :: struct {
+	idx:              int, // the assistant message in ctx.messages; -1 before the first event
+	started:          bool,
+	overflow_retried: bool,
 }
 
 // Stream one assistant response, updating the in-context partial message.
@@ -166,146 +175,166 @@ stream_assistant :: proc(
 	// keeping it out of ctx.messages until then means compaction and context
 	// transforms never see an empty placeholder, and on overflow retry we can
 	// simply drop the partial before compacting.
-	idx := -1
-	started := false
-	overflow_retried := false
-
+	st := Turn_State{idx = -1}
 	for {
 		if cfg.compact != nil {
-			if data := cfg.compact(ctx, cfg, cfg.userdata); data != nil {
+			if data := cfg.compact(ctx, cfg, cancel, cfg.userdata); data != nil {
 				emit(Event_Compaction{data = data}, emit_userdata)
 			}
 		}
-
-		messages := ctx.messages[:]
-		if cfg.transform_context != nil {
-			messages = cfg.transform_context(messages, cfg.userdata)
+		retry, err := stream_attempt(ctx, cfg, emit, emit_userdata, cancel, allocator, &st)
+		if err != nil {
+			return -1, err
 		}
-		llm_messages := convert_to_llm(messages, allocator)
-		llm_ctx := ai.Context {
-			system_prompt = ctx.system_prompt,
-			messages = llm_messages,
-		}
-		tool_defs := make([dynamic]ai.Tool_Definition, 0, len(ctx.tools), allocator)
-		for t in ctx.tools {
-			append(&tool_defs, ai.Tool_Definition {
-				name = t.name,
-				description = t.description,
-				parameters_json = t.parameters_json,
-			})
-		}
-		llm_ctx.tools = tool_defs[:]
-
-		attempt_started := time.tick_now()
-		stream, serr := cfg.stream(cfg.model, llm_ctx, cfg.api_key, cancel, allocator)
-		if serr != nil {
-			return -1, serr == .Aborted ? .Aborted : .Stream_Failed
-		}
-
-		retry := false
-		finished := false
-		for {
-			ev, ok := stream.next(&stream)
-			if !ok {
-				finished = true
-				break
-			}
-			switch ev.kind {
-			case .Start:
-			case .Text_Delta, .Thinking_Delta, .Tool_Call_Delta:
-				if idx < 0 {
-					append(&ctx.messages, Agent_Message {
-						role = .Assistant,
-						timestamp = time.to_unix_seconds(time.now()),
-					})
-					idx = len(ctx.messages) - 1
-				}
-				sync_partial(&ctx.messages[idx], ev.partial)
-				if !started {
-					started = true
-					emit(Event_Message_Start{message = &ctx.messages[idx]}, emit_userdata)
-				}
-				emit(Event_Message_Update{message = &ctx.messages[idx]}, emit_userdata)
-			case .Done:
-				if idx < 0 {
-					append(&ctx.messages, Agent_Message {
-						role = .Assistant,
-						timestamp = time.to_unix_seconds(time.now()),
-					})
-					idx = len(ctx.messages) - 1
-				}
-				final := stream.result(&stream)
-				ctx.messages[idx] = assistant_from_wire(final, ctx.messages[idx].timestamp)
-				stamp(&ctx.messages[idx], cfg, attempt_started)
-				if !started {
-					emit(Event_Message_Start{message = &ctx.messages[idx]}, emit_userdata)
-				}
-				emit(Event_Message_End{message = &ctx.messages[idx]}, emit_userdata)
-				finished = true
-			case .Error:
-				// ponytail: overflow detected by substring — providers phrase
-				// it differently ("context length", "maximum tokens"). One
-				// retry; a second overflow fails the turn.
-				if !overflow_retried && cfg.compact != nil && strings.contains(ev.text, "context") {
-					overflow_retried = true
-					retry = true
-					break
-				}
-				if idx < 0 {
-					append(&ctx.messages, Agent_Message {
-						role = .Assistant,
-						timestamp = time.to_unix_seconds(time.now()),
-					})
-					idx = len(ctx.messages) - 1
-				}
-				if ev.partial != nil {
-					sync_partial(&ctx.messages[idx], ev.partial)
-					ctx.messages[idx].usage = ev.partial.usage
-				}
-				ctx.messages[idx].stop_reason = ev.reason == .Aborted ? .Aborted : .Error
-				ctx.messages[idx].tool_calls = nil
-				ctx.messages[idx].text = ev.text
-				stamp(&ctx.messages[idx], cfg, attempt_started)
-				if !started {
-					emit(Event_Message_Start{message = &ctx.messages[idx]}, emit_userdata)
-				}
-				emit(Event_Message_End{message = &ctx.messages[idx]}, emit_userdata)
-				finished = true
-			}
-			if finished || retry {
-				break
-			}
-		}
-		stream.close(&stream)
-
 		if retry {
-			if idx >= 0 {
-				assert(idx == len(ctx.messages) - 1)
-				_ = pop(&ctx.messages)
-				idx = -1
-				started = false
-			}
 			continue
 		}
-		if !finished {
-			// stream ended without a terminal event — treat what we have as final
-			if idx < 0 {
-				append(&ctx.messages, Agent_Message {
-					role = .Assistant,
-					timestamp = time.to_unix_seconds(time.now()),
-				})
-				idx = len(ctx.messages) - 1
-			}
-			final := stream.result(&stream)
-			ctx.messages[idx] = assistant_from_wire(final, ctx.messages[idx].timestamp)
-			stamp(&ctx.messages[idx], cfg, attempt_started)
-			if !started {
-				emit(Event_Message_Start{message = &ctx.messages[idx]}, emit_userdata)
-			}
-			emit(Event_Message_End{message = &ctx.messages[idx]}, emit_userdata)
-		}
-		return idx, nil
+		return st.idx, nil
 	}
+}
+
+// stream_attempt makes one provider request. Everything the request and its
+// stream allocate lives in an arena freed on return; the finished message is
+// copied to allocator first.
+stream_attempt :: proc(
+	ctx: ^Context,
+	cfg: ^Loop_Config,
+	emit: Emit,
+	emit_userdata: rawptr,
+	cancel: ^ai.Cancellation,
+	allocator: mem.Allocator,
+	st: ^Turn_State,
+) -> (
+	retry: bool,
+	err: Error,
+) {
+	arena: mem.Dynamic_Arena
+	mem.dynamic_arena_init(&arena)
+	defer mem.dynamic_arena_destroy(&arena)
+	scratch := mem.dynamic_arena_allocator(&arena)
+
+	messages := ctx.messages[:]
+	if cfg.transform_context != nil {
+		context.allocator = scratch
+		messages = cfg.transform_context(messages, cfg.userdata)
+	}
+	llm_ctx := ai.Context {
+		system_prompt = ctx.system_prompt,
+		messages = convert_to_llm(messages, scratch),
+	}
+	tool_defs := make([dynamic]ai.Tool_Definition, 0, len(ctx.tools), scratch)
+	for t in ctx.tools {
+		append(&tool_defs, ai.Tool_Definition {
+			name = t.name,
+			description = t.description,
+			parameters_json = t.parameters_json,
+		})
+	}
+	llm_ctx.tools = tool_defs[:]
+
+	attempt_started := time.tick_now()
+	stream, serr := cfg.stream(cfg.model, llm_ctx, cfg.api_key, cancel, scratch)
+	if serr != nil {
+		return false, serr == .Aborted ? .Aborted : .Stream_Failed
+	}
+
+	finished := false
+	for {
+		ev, ok := stream.next(&stream)
+		if !ok {
+			finished = true
+			break
+		}
+		switch ev.kind {
+		case .Start:
+		case .Text_Delta, .Thinking_Delta, .Tool_Call_Delta:
+			ensure_message(ctx, st)
+			sync_partial(&ctx.messages[st.idx], ev.partial)
+			if !st.started {
+				st.started = true
+				emit(Event_Message_Start{message = &ctx.messages[st.idx]}, emit_userdata)
+			}
+			emit(Event_Message_Update{message = &ctx.messages[st.idx]}, emit_userdata)
+		case .Done:
+			ensure_message(ctx, st)
+			final := stream.result(&stream)
+			ctx.messages[st.idx] = assistant_from_wire(final, ctx.messages[st.idx].timestamp)
+			finish_message(ctx, st, cfg, attempt_started, allocator, emit, emit_userdata)
+			finished = true
+		case .Error:
+			// ponytail: overflow detected by substring — providers phrase
+			// it differently ("context length", "maximum tokens"). One
+			// retry; a second overflow fails the turn.
+			if !st.overflow_retried && cfg.compact != nil && strings.contains(ev.text, "context") {
+				st.overflow_retried = true
+				retry = true
+				break
+			}
+			ensure_message(ctx, st)
+			if ev.partial != nil {
+				sync_partial(&ctx.messages[st.idx], ev.partial)
+				ctx.messages[st.idx].usage = ev.partial.usage
+			}
+			ctx.messages[st.idx].stop_reason = ev.reason == .Aborted ? .Aborted : .Error
+			ctx.messages[st.idx].tool_calls = nil
+			ctx.messages[st.idx].text = ev.text
+			finish_message(ctx, st, cfg, attempt_started, allocator, emit, emit_userdata)
+			finished = true
+		}
+		if finished || retry {
+			break
+		}
+	}
+
+	if retry {
+		stream.close(&stream)
+		if st.idx >= 0 {
+			assert(st.idx == len(ctx.messages) - 1)
+			_ = pop(&ctx.messages)
+			st.idx = -1
+			st.started = false
+		}
+		return true, nil
+	}
+	if !finished {
+		// stream ended without a terminal event — treat what we have as final
+		ensure_message(ctx, st)
+		final := stream.result(&stream)
+		ctx.messages[st.idx] = assistant_from_wire(final, ctx.messages[st.idx].timestamp)
+		finish_message(ctx, st, cfg, attempt_started, allocator, emit, emit_userdata)
+	}
+	stream.close(&stream)
+	return false, nil
+}
+
+// ensure_message appends the assistant placeholder on the first event.
+ensure_message :: proc(ctx: ^Context, st: ^Turn_State) {
+	if st.idx >= 0 { return }
+	append(&ctx.messages, Agent_Message {
+		role = .Assistant,
+		timestamp = time.to_unix_seconds(time.now()),
+	})
+	st.idx = len(ctx.messages) - 1
+}
+
+// finish_message makes the assistant message self-contained (its strings were
+// allocated in the attempt's arena) and announces it.
+finish_message :: proc(
+	ctx: ^Context,
+	st: ^Turn_State,
+	cfg: ^Loop_Config,
+	attempt_started: time.Tick,
+	allocator: mem.Allocator,
+	emit: Emit,
+	emit_userdata: rawptr,
+) {
+	msg := &ctx.messages[st.idx]
+	own_message(msg, allocator)
+	stamp(msg, cfg, attempt_started)
+	if !st.started {
+		emit(Event_Message_Start{message = msg}, emit_userdata)
+	}
+	emit(Event_Message_End{message = msg}, emit_userdata)
 }
 
 // stamp records which model answered and how long the request took.
@@ -357,6 +386,7 @@ execute_tool_calls :: proc(
 ) -> bool {
 	calls := msg.tool_calls
 	jobs := make([]Tool_Job, len(calls), allocator)
+	defer delete(jobs, allocator)
 
 	// Resolve and permission-check on the loop thread; runnable calls get a
 	// tool pointer, everything else gets its (error) result up front.

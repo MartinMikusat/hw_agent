@@ -20,6 +20,7 @@ test_tools_on_a_project :: proc(t: ^testing.T) {
 	_ = os.write_entire_file(fmt.tprintf("%s/docs/readme.md", root), transmute([]u8)string("# Docs\n"))
 
 	index, ok := index_for(root)
+	defer shutdown()
 	if !testing.expect(t, ok) { return }
 	same, _ := index_for(root)
 	testing.expect(t, same == index, "one index per root")

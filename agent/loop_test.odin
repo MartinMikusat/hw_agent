@@ -9,6 +9,7 @@ import "base:runtime"
 import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
+import "core:slice"
 import "core:strings"
 import "core:sync"
 import "core:testing"
@@ -110,22 +111,22 @@ rig_tool :: proc(
 	return {text = "fake-out"}
 }
 
-rig_steer :: proc(userdata: rawptr) -> []Agent_Message {
+rig_steer :: proc(userdata: rawptr, allocator: mem.Allocator) -> []Agent_Message {
 	f := cast(^Fake)userdata
 	if f.steer_sent {
 		return nil
 	}
 	f.steer_sent = true
-	return f.steer
+	return slice.clone(f.steer, allocator)
 }
 
-rig_follow :: proc(userdata: rawptr) -> []Agent_Message {
+rig_follow :: proc(userdata: rawptr, allocator: mem.Allocator) -> []Agent_Message {
 	f := cast(^Fake)userdata
 	if f.follow_sent {
 		return nil
 	}
 	f.follow_sent = true
-	return f.follow
+	return slice.clone(f.follow, allocator)
 }
 
 rig_block :: proc(call: ai.Tool_Call, userdata: rawptr) -> (bool, string) {

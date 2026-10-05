@@ -1,6 +1,7 @@
 package agent
 
 import "core:encoding/json"
+import "core:mem"
 
 import "../ai"
 
@@ -141,11 +142,13 @@ Loop_Config :: struct {
 	model:             ai.Model,
 	stream:            ai.Stream_Fn,
 	api_key:           string,
-	get_steering:      proc(userdata: rawptr) -> []Agent_Message,  // drained before each generation
-	get_follow_up:     proc(userdata: rawptr) -> []Agent_Message,  // drained when the run would settle
+	// Drained before each generation / when the run would settle. The slice is
+	// allocated with the given allocator; the loop frees it once consumed.
+	get_steering:      proc(userdata: rawptr, allocator: mem.Allocator) -> []Agent_Message,
+	get_follow_up:     proc(userdata: rawptr, allocator: mem.Allocator) -> []Agent_Message,
 	before_tool_call:  proc(call: ai.Tool_Call, userdata: rawptr) -> (block: bool, reason: string),
 	transform_context: proc(messages: []Agent_Message, userdata: rawptr) -> []Agent_Message,
-	compact:           proc(ctx: ^Context, cfg: ^Loop_Config, userdata: rawptr) -> ^Compaction, // nil = no compaction needed/done
+	compact:           proc(ctx: ^Context, cfg: ^Loop_Config, cancel: ^ai.Cancellation, userdata: rawptr) -> ^Compaction, // nil = no compaction needed/done
 	should_stop:       proc(userdata: rawptr) -> bool,             // checked after each turn
 	userdata:          rawptr,
 }

@@ -26,7 +26,7 @@ mk_srv :: proc() -> ^Server {
 
 cmd :: proc(srv: ^Server, c, text: string) {
 	s := fmt.aprintf(`{{"cmd":"%s","text":"%s"}}`, c, text, allocator = context.temp_allocator)
-	v, _ := json.parse_string(s)
+	v, _ := json.parse_string(s, allocator = context.temp_allocator)
 	handle_command(srv, v)
 }
 
@@ -54,11 +54,11 @@ test_command_routing :: proc(t: ^testing.T) {
 	testing.expect_value(t, srv.follow_q[0].text, "later")
 
 	// drains return contents and clear
-	steer := drain_steering(srv)
+	steer := drain_steering(srv, context.temp_allocator)
 	testing.expect_value(t, len(steer), 2)
 	testing.expect_value(t, len(srv.steer_q), 0)
-	testing.expect_value(t, len(drain_steering(srv)), 0)
-	follow := drain_follow_up(srv)
+	testing.expect_value(t, len(drain_steering(srv, context.temp_allocator)), 0)
+	follow := drain_follow_up(srv, context.temp_allocator)
 	testing.expect_value(t, len(follow), 1)
 
 	// abort sets the shared cancel flag
@@ -81,6 +81,7 @@ Capture :: struct {
 }
 
 capture_write :: proc(line: []u8, userdata: rawptr) {
+	context.allocator = runtime.heap_allocator() // also called from the hook's thread
 	c := cast(^Capture)userdata
 	sync.mutex_lock(&c.mu)
 	defer sync.mutex_unlock(&c.mu)

@@ -55,6 +55,6 @@ search_execute :: proc(
 	if err != nil {
 		return {text = "invalid arguments", is_error = true}
 	}
-	text, is_error := fff.call(state.index, state.name, string(encoded))
+	text, is_error := fff.call(state.index, state.name, string(encoded), context.temp_allocator)
 	return {text = text, is_error = is_error}
 }

@@ -50,4 +50,4 @@ if [ -n "$PLIST" ]; then
   set -- "$@" -extra-linker-flags:"-sectcreate __TEXT __info_plist $PLIST"
 fi
 # shellcheck disable=SC2086
-hw-odin build "$ROOT" "$@" $ODIN_FLAGS
+hw-odin build "$ROOT" -vet -strict-style "$@" $ODIN_FLAGS

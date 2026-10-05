@@ -74,6 +74,18 @@ index_for :: proc(cwd: string) -> (Index, bool) {
 	return index, true
 }
 
+// shutdown closes every index (stopping its watcher) and frees the registry.
+shutdown :: proc() {
+	sync.mutex_lock(&registry.mu)
+	defer sync.mutex_unlock(&registry.mu)
+	for root, index in registry.indexes {
+		hwfff_close(index)
+		delete(root)
+	}
+	delete(registry.indexes)
+	registry.indexes = nil
+}
+
 // call runs one fff tool; the text is allocated with allocator.
 call :: proc(index: Index, tool, args_json: string, allocator := context.allocator) -> (text: string, is_error: bool) {
 	raw := hwfff_call(index, strings.clone_to_cstring(tool, context.temp_allocator), strings.clone_to_cstring(args_json, context.temp_allocator), &is_error)
