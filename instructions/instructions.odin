@@ -28,7 +28,7 @@ load :: proc(cwd, home: string, allocator := context.allocator) -> []Source {
 		add(&sources, fmt.tprintf("%s/%s", strings.trim_right(home, "/"), GLOBAL_FILE), allocator)
 	}
 	dirs := make([dynamic]string, context.temp_allocator)
-	root := project_root(cwd)
+	root := find_root(cwd)
 	for dir := cwd; ; dir = parent(dir) {
 		append(&dirs, dir)
 		if dir == root || dir == "/" { break }
@@ -90,8 +90,9 @@ basename :: proc(path: string) -> string {
 	return path[strings.last_index_byte(path, '/') + 1:]
 }
 
-@(private)
-project_root :: proc(cwd: string) -> string {
+// find_root is the project root for cwd: the nearest ancestor holding .git,
+// else cwd itself.
+find_root :: proc(cwd: string) -> string {
 	for dir := cwd; ; dir = parent(dir) {
 		if os.exists(fmt.tprintf("%s/.git", strings.trim_right(dir, "/"))) { return dir }
 		if dir == "/" { break }

@@ -15,6 +15,7 @@ import "compact"
 import "keychain"
 import "fff"
 import "instructions"
+import "permissions"
 import devlog "devlog:."
 import "rpc"
 import "session"
@@ -37,6 +38,7 @@ USAGE :: `usage: hw_agent "<prompt>" [-model=<id>] [-session=<path>]
        hw_agent -show=<id|path>            readable transcript
        hw_agent -export=<id|path> [-json]  full Markdown (or JSON) transcript
        hw_agent -rm=<id|path>              delete a session and its traces
+       hw_agent -yes ...                   approve every permission ask (print and -rpc modes)
        hw_agent -version`
 
 API_KEY_ENV :: "OPENROUTER_API_KEY"
@@ -49,6 +51,7 @@ main :: proc() {
 	mode := ""
 	target := ""
 	as_json := false
+	auto_approve := false
 	for arg in os.args[1:] {
 		if arg == "-version" {
 			fmt.println(APP_VERSION)
@@ -62,6 +65,8 @@ main :: proc() {
 			mode, target = arg[:eq], arg[eq + 1:]
 		} else if arg == "-json" {
 			as_json = true
+		} else if arg == "-yes" {
+			auto_approve = true
 		} else if strings.has_prefix(arg, "-model=") {
 			model_id = arg[7:]
 		} else if strings.has_prefix(arg, "-session=") {
@@ -121,6 +126,12 @@ main :: proc() {
 		start_trace_pruning(traces_dir(), false)
 	}
 	cwd, _ := os.get_working_directory(context.allocator)
+	gate, rules_error := permissions.load(cwd, permissions_path())
+	if rules_error != "" {
+		fmt.eprintln(rules_error)
+		exit(1)
+	}
+	gate.auto_approve = auto_approve
 	ctx := agent.Context {
 		system_prompt = instructions.render(system_prompt(context.allocator), instructions.load(cwd, os.get_env("HOME", context.allocator))),
 		tools = make_tools(context.allocator, cwd),
@@ -155,9 +166,11 @@ main :: proc() {
 	}
 
 	if rpc_mode {
-		rpc.serve(&ctx, &cfg, emit, emit_userdata, &cancel, context.allocator)
+		rpc.serve(&ctx, &cfg, emit, emit_userdata, &cancel, gate, context.allocator)
 		return
 	}
+	cfg.before_tool_call = print_permission_hook
+	cfg.userdata = gate
 
 	prompts := []agent.Agent_Message{{
 		role = .User,
@@ -198,6 +211,23 @@ make_tools :: proc(allocator: mem.Allocator, cwd: string) -> []agent.Tool_Defini
 // system_prompt adds fff's search guidance, as fff-mcp gives Claude Code.
 system_prompt :: proc(allocator: mem.Allocator) -> string {
 	return strings.concatenate({SYSTEM_PROMPT, "\n\n# File search\n\n", fff.instructions()}, allocator)
+}
+
+// print_permission_hook applies the rules in print mode, where nobody can
+// answer an ask: it is denied unless -yes was given.
+print_permission_hook :: proc(call: ai.Tool_Call, userdata: rawptr) -> (block: bool, reason: string) {
+	gate := cast(^permissions.Gate)userdata
+	decision := permissions.evaluate(gate, call.name, call.arguments)
+	switch decision.action {
+	case .Allow:
+		return false, ""
+	case .Deny:
+		return true, fmt.aprintf("Blocked by a permission rule (%s). Do not retry this call; choose another approach.", decision.rule)
+	case .Ask:
+		if gate.auto_approve { return false, "" }
+		return true, fmt.aprintf("This call needs approval (%s) but print mode has no way to ask; rerun with -yes or use the daemon.", decision.rule)
+	}
+	return true, "permission check failed"
 }
 
 // exit closes the dev log first, so a deliberate exit is never read as a crash.

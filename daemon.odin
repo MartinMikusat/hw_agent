@@ -48,6 +48,7 @@ serve_daemon :: proc(base: agent.Loop_Config) -> int {
 		system_prompt = system_prompt(context.allocator),
 		default_cwd   = default_cwd(),
 		home          = os.get_env("HOME", context.allocator),
+		permissions_path = permissions_path(),
 		base          = base,
 		make_tools    = make_tools,
 	}
@@ -67,6 +68,10 @@ serve_daemon :: proc(base: agent.Loop_Config) -> int {
 	if len(cfg.traces_dir) > 0 { start_trace_pruning(cfg.traces_dir, true) }
 	serve.run(d)
 	return 0
+}
+
+permissions_path :: proc() -> string {
+	return fmt.aprintf("%s/permissions.json", support_dir())
 }
 
 default_cwd :: proc() -> string {

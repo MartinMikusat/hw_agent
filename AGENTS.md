@@ -32,6 +32,15 @@ Project instructions (`instructions/`) go into every session's system prompt:
 to the session's cwd, 32 KB each; `created`/`snapshot` list the files loaded.
 Read when a session starts or resumes, not live.
 
+Tool permissions (`permissions/`): rules `{"action":"allow|ask|deny","tool","match"}` in
+`~/Library/Application Support/hw_agent/permissions.json` and, tighten-only (ask/deny),
+`<git root>/.hw_agent/permissions.json`. `match` is a glob over the bash command or the
+absolute path (read/write/edit). Default is allow; any matching deny wins, else the last
+match. An ask goes to clients as `permission_request` (stdio `-rpc` and the daemon; answer
+with the `permission` command); with no client attached, or after 5 minutes, it is denied.
+Print mode denies asks unless `-yes`. A rules file that does not parse is an error, never
+ignored. Patterns are a guardrail, not a sandbox.
+
 `bash` runs each command in its own process group (120 s default timeout, `timeout`
 argument up to 3600): abort or timeout stops the whole group, and processes left
 running when bash exits are stopped too.

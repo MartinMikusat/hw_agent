@@ -5,6 +5,8 @@
 //        {"cmd":"steer","text":"..."}      inject before next generation
 //        {"cmd":"follow_up","text":"..."}  run after the agent settles
 //        {"cmd":"abort"}                   cancel the in-flight run
+//        {"cmd":"permission","id":"p1","decision":"allow|allow_session|deny","text"?:"reason"}
+//                                          answer a permission_request
 //        {"cmd":"quit"}                    exit after current run settles
 //
 //   out: {"type":"ready"}
@@ -17,6 +19,9 @@
 //        {"type":"tool_start","id":"...","name":"...","arguments":"..."}
 //        {"type":"tool_end","id":"...","name":"...","text":"...","is_error":bool}
 //        {"type":"compaction","summary":"...","tokens_before":int}
+//        {"type":"permission_request","id":"p1","tool":"...","target":"...","arguments":"...","rule":"..."}
+//                                          a tool call needs approval; the run waits
+//        {"type":"permission_resolved","id":"p1","decision":"allow|allow_session|deny|timeout|aborted"}
 //        {"type":"error","text":"..."}
 //
 // Architecture: a reader thread parses stdin into queues; the main thread runs
@@ -44,8 +49,10 @@ import "core:strings"
 import "core:sync"
 import "core:sync/chan"
 import "core:thread"
+import "core:time"
 import "../agent"
 import "../ai"
+import "../permissions"
 
 Server :: struct {
 	ctx:       ^agent.Context,
@@ -59,6 +66,36 @@ Server :: struct {
 	quitting:  bool, // atomic
 	sink:      ^Line_Sink, // nil = stdout
 	allocator: mem.Allocator,
+	owner:     rawptr, // for the transport that embeds this server
+
+	gate:        ^permissions.Gate, // nil: every tool call is allowed
+	approval:    Approval,
+	ask_timeout: time.Duration,      // 0 = PERMISSION_TIMEOUT
+}
+
+PERMISSION_TIMEOUT :: 5 * time.Minute
+
+Decision_Kind :: enum {
+	Deny,
+	Allow,
+	Allow_Session,
+}
+
+// Approval is the one permission request a run can have open: tool calls are
+// checked in order on the loop thread, which waits for the answer.
+Approval :: struct {
+	mu:       sync.Mutex,
+	cond:     sync.Cond,
+	counter:  int,
+	active:   bool,
+	id:       string, // strings below are owned by Server.allocator
+	tool:     string,
+	target:   string,
+	arguments: string,
+	rule:     string,
+	answered: bool,
+	decision: Decision_Kind,
+	reason:   string,
 }
 
 // Where JSONL lines go. session != "" adds a "session" field to every line.
@@ -66,6 +103,9 @@ Line_Sink :: struct {
 	write:    proc(line: []u8, userdata: rawptr),
 	userdata: rawptr,
 	session:  string,
+	// listening reports whether anyone can answer a permission request; nil
+	// means yes (stdout has a reader).
+	listening: proc(userdata: rawptr) -> bool,
 }
 
 // Queues + cancel for one agent context; cfg's steering/follow-up hooks and
@@ -94,11 +134,13 @@ serve :: proc(
 	emit: agent.Emit,
 	emit_userdata: rawptr,
 	cancel: ^ai.Cancellation,
+	gate: ^permissions.Gate,
 	allocator: mem.Allocator,
 ) {
 	srv := new(Server, allocator)
 	srv.ctx = ctx
 	init_server(srv, cfg, cancel, nil, allocator)
+	set_permissions(srv, gate)
 
 	// No join: serve returning means process exit, and a blocking stdin read
 	// can't be interrupted — joining here would hang a quit-with-open-stdin.
@@ -230,6 +272,10 @@ handle_command :: proc(srv: ^Server, v: json.Value) {
 		}
 	case "abort":
 		sync.atomic_store(&srv.cancel.flag, true)
+	case "permission":
+		id, _ := obj["id"].(json.String)
+		decision, _ := obj["decision"].(json.String)
+		answer_permission(srv, string(id), string(decision), text)
 	case "quit":
 		sync.atomic_store(&srv.quitting, true)
 		chan.send(srv.prompt_ch, "")
@@ -279,4 +325,142 @@ write_line :: proc(sink: ^Line_Sink, data: []u8) {
 	copy(line, data)
 	line[len(data)] = '\n'
 	sink.write(line, sink.userdata)
+}
+
+// set_permissions gates every tool call of this server's runs on the rules; nil
+// leaves them all allowed.
+set_permissions :: proc(srv: ^Server, gate: ^permissions.Gate) {
+	srv.gate = gate
+	srv.cfg.before_tool_call = gate == nil ? nil : permission_hook
+}
+
+// permission_hook is Loop_Config.before_tool_call: rules decide, and an ask is put
+// to a client. Block reasons reach the model as the tool result, so they are
+// allocated for the transcript, not the temp allocator.
+permission_hook :: proc(call: ai.Tool_Call, userdata: rawptr) -> (block: bool, reason: string) {
+	srv := cast(^Server)userdata
+	decision := permissions.evaluate(srv.gate, call.name, call.arguments)
+	switch decision.action {
+	case .Allow:
+		return false, ""
+	case .Deny:
+		return true, fmt.aprintf("Blocked by a permission rule (%s). Do not retry this call; choose another approach.", decision.rule, allocator = srv.allocator)
+	case .Ask:
+		if srv.gate.auto_approve { return false, "" }
+		outcome, answer := ask(srv, call, decision)
+		switch outcome {
+		case .Allow:
+			return false, ""
+		case .Allow_Session:
+			permissions.grant(srv.gate, call.name, decision.target)
+			return false, ""
+		case .Deny:
+			return true, answer
+		}
+	}
+	return true, "permission check failed"
+}
+
+@(private)
+has_listener :: proc(srv: ^Server) -> bool {
+	return srv.sink == nil || srv.sink.listening == nil || srv.sink.listening(srv.sink.userdata)
+}
+
+// ask puts one tool call to the clients and waits for the first answer, the
+// timeout, an abort or a quit. The returned text is the model-facing reason when
+// the call is denied.
+@(private)
+ask :: proc(srv: ^Server, call: ai.Tool_Call, decision: permissions.Decision) -> (Decision_Kind, string) {
+	a := srv.allocator
+	if !has_listener(srv) {
+		return .Deny, fmt.aprintf("This call needs approval (%s) but no client is connected to give it.", decision.rule, allocator = a)
+	}
+	ap := &srv.approval
+	sync.mutex_lock(&ap.mu)
+	ap.counter += 1
+	ap.id = fmt.aprintf("p%d", ap.counter, allocator = a)
+	ap.tool = strings.clone(call.name, a)
+	ap.target = strings.clone(decision.target, a)
+	ap.arguments = strings.clone(call.arguments, a)
+	ap.rule = strings.clone(decision.rule, a)
+	ap.answered = false
+	ap.reason = ""
+	ap.active = true
+	id := strings.clone(ap.id, context.temp_allocator) // ap.id is freed below
+	sync.mutex_unlock(&ap.mu)
+
+	emit_line(srv.sink, "permission_request", map[string]json.Value{
+		"id" = id, "tool" = ap.tool, "target" = ap.target, "arguments" = ap.arguments, "rule" = ap.rule,
+	})
+
+	timeout := srv.ask_timeout > 0 ? srv.ask_timeout : PERMISSION_TIMEOUT
+	deadline := time.tick_add(time.tick_now(), timeout)
+	outcome := "timeout"
+	sync.mutex_lock(&ap.mu)
+	for !ap.answered {
+		if sync.atomic_load(&srv.cancel.flag) { outcome = "aborted"; break }
+		if sync.atomic_load(&srv.quitting) { outcome = "aborted"; break }
+		if time.tick_diff(time.tick_now(), deadline) <= 0 { break }
+		sync.cond_wait_with_timeout(&ap.cond, &ap.mu, 100 * time.Millisecond)
+	}
+	kind := Decision_Kind.Deny
+	reason := ""
+	if ap.answered {
+		kind = ap.decision
+		reason = ap.reason
+		outcome = kind == .Allow ? "allow" : kind == .Allow_Session ? "allow_session" : "deny"
+	}
+	ap.active = false
+	delete(ap.id, a)
+	delete(ap.tool, a)
+	delete(ap.target, a)
+	delete(ap.arguments, a)
+	delete(ap.rule, a)
+	sync.mutex_unlock(&ap.mu)
+
+	emit_line(srv.sink, "permission_resolved", map[string]json.Value{"id" = id, "decision" = outcome})
+	if kind != .Deny { return kind, "" }
+	switch outcome {
+	case "timeout": return .Deny, fmt.aprintf("No approval was given within %v; the call was denied.", timeout, allocator = a)
+	case "aborted": return .Deny, "The run was aborted before this call was approved."
+	}
+	if len(reason) > 0 { return .Deny, fmt.aprintf("The user denied this call: %s", reason, allocator = a) }
+	return .Deny, "The user denied this call."
+}
+
+// answer_permission records the first answer to the open request; stale or
+// unknown ids and unknown decisions are ignored.
+@(private)
+answer_permission :: proc(srv: ^Server, id, decision, reason: string) {
+	kind: Decision_Kind
+	switch decision {
+	case "allow":         kind = .Allow
+	case "allow_session": kind = .Allow_Session
+	case "deny":          kind = .Deny
+	case: return
+	}
+	ap := &srv.approval
+	sync.mutex_lock(&ap.mu)
+	defer sync.mutex_unlock(&ap.mu)
+	if !ap.active || ap.answered || ap.id != id { return }
+	ap.answered = true
+	ap.decision = kind
+	ap.reason = reason
+	sync.cond_signal(&ap.cond)
+}
+
+// pending_permission describes the open request for clients that attach while
+// it waits; nil when there is none. Strings are temp-allocated.
+pending_permission :: proc(srv: ^Server) -> json.Value {
+	ap := &srv.approval
+	sync.mutex_lock(&ap.mu)
+	defer sync.mutex_unlock(&ap.mu)
+	if !ap.active { return nil }
+	return json.Object{
+		"id" = strings.clone(ap.id, context.temp_allocator),
+		"tool" = strings.clone(ap.tool, context.temp_allocator),
+		"target" = strings.clone(ap.target, context.temp_allocator),
+		"arguments" = strings.clone(ap.arguments, context.temp_allocator),
+		"rule" = strings.clone(ap.rule, context.temp_allocator),
+	}
 }

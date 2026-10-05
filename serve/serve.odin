@@ -14,6 +14,10 @@
 //                                                  and every attached client; refused while running
 //        {"cmd":"prompt"|"steer"|"follow_up"|"abort","session":id,"text"?:"..."}
 //                                                  stdio RPC semantics per session
+//        {"cmd":"permission","session":id,"id":"p1","decision":"allow|allow_session|deny"}
+//                                                  answers a permission_request (first answer wins);
+//                                                  a snapshot carries "permission":{...} while one is open
+//                                                  (rules: permissions/permissions.odin)
 //   out: every stdio RPC event plus "session":id; failures are
 //        {"type":"error","session"?:id,"text":"..."}. Any command may carry
 //        "req", echoed on its direct reply.
@@ -48,6 +52,7 @@ import devlog "devlog:."
 import "../agent"
 import "../ai"
 import "../instructions"
+import "../permissions"
 import "../rpc"
 import "../session"
 
@@ -58,6 +63,7 @@ Config :: struct {
 	default_model: string,
 	default_cwd:   string, // for sessions created without one and logs that predate cwd
 	home:          string, // for the global instruction file
+	permissions_path: string, // global rules file; the project's lives in <root>/.hw_agent
 	system_prompt: string,
 	base:          agent.Loop_Config, // per-session copy; model.id is replaced
 	make_tools:    proc(allocator: mem.Allocator, cwd: string) -> []agent.Tool_Definition,
@@ -362,7 +368,7 @@ handle :: proc(d: ^Daemon, c: ^Conn, v: json.Value) {
 			return
 		}
 		unsubscribe(ls, c)
-	case "prompt", "steer", "follow_up", "abort":
+	case "prompt", "steer", "follow_up", "abort", "permission":
 		ls, err := live(d, string(id))
 		if err != "" {
 			reply_error(c, req, string(id), err)
@@ -448,6 +454,13 @@ create_session :: proc(d: ^Daemon, model, cwd: string) -> (^Live_Session, string
 @(private)
 start_session :: proc(d: ^Daemon, id, path, new_model, new_cwd: string) -> (^Live_Session, string) {
 	a := d.allocator
+	// Rules come first for a new session so a bad file leaves no empty log behind.
+	gate: ^permissions.Gate
+	if len(new_cwd) > 0 {
+		rules, rules_err := permissions.load(new_cwd, d.cfg.permissions_path, a)
+		if rules_err != "" { return nil, rules_err }
+		gate = rules
+	}
 	sess, messages, err := session.open(path, a)
 	if err != nil { return nil, fmt.tprintf("session open failed: %v", err) } // recorded by session.open
 	if len(new_model) > 0 {
@@ -458,12 +471,22 @@ start_session :: proc(d: ^Daemon, id, path, new_model, new_cwd: string) -> (^Liv
 		}
 	}
 
+	cwd := len(sess.cwd) > 0 ? sess.cwd : strings.clone(d.cfg.default_cwd, a)
+	if gate == nil {
+		rules, rules_err := permissions.load(cwd, d.cfg.permissions_path, a)
+		if rules_err != "" {
+			session.close(sess)
+			return nil, rules_err
+		}
+		gate = rules
+	}
+
 	ls := new(Live_Session, a)
 	ls.id = strings.clone(id, a)
 	ls.path = strings.clone(path, a)
 	ls.sess = sess
 	ls.subs = make([dynamic]^Conn, 0, 4, a)
-	ls.cwd = len(sess.cwd) > 0 ? sess.cwd : strings.clone(d.cfg.default_cwd, a)
+	ls.cwd = cwd
 	sources := instructions.load(ls.cwd, d.cfg.home, a)
 	ls.instructions = instructions.paths(sources, a)
 	ls.ctx.system_prompt = instructions.render(d.cfg.system_prompt, sources, a)
@@ -475,9 +498,10 @@ start_session :: proc(d: ^Daemon, id, path, new_model, new_cwd: string) -> (^Liv
 	if len(d.cfg.traces_dir) > 0 {
 		ls.cfg.model.provider_options.trace_dir = fmt.aprintf("%s/%s", d.cfg.traces_dir, ls.id, allocator = a)
 	}
-	ls.sink = {write = fan_out, userdata = ls, session = ls.id}
+	ls.sink = {write = fan_out, userdata = ls, session = ls.id, listening = has_subscribers}
 	rpc.init_server(&ls.srv, &ls.cfg, &ls.cancel, &ls.sink, a)
 	ls.srv.ctx = &ls.ctx
+	rpc.set_permissions(&ls.srv, gate)
 	ls.persist = {session = sess, inner = rpc.emit_json, inner_userdata = &ls.sink}
 	d.sessions[ls.id] = ls
 	thread.create_and_start_with_data(ls, session_main, self_cleanup = true)
@@ -497,6 +521,16 @@ session_emit :: proc(event: agent.Event, userdata: rawptr) {
 	sync.recursive_mutex_lock(&ls.mu)
 	defer sync.recursive_mutex_unlock(&ls.mu)
 	session.emit(event, &ls.persist)
+}
+
+// has_subscribers: a permission request can only be answered when a client is
+// attached to the session.
+@(private)
+has_subscribers :: proc(userdata: rawptr) -> bool {
+	ls := cast(^Live_Session)userdata
+	sync.recursive_mutex_lock(&ls.mu)
+	defer sync.recursive_mutex_unlock(&ls.mu)
+	return len(ls.subs) > 0
 }
 
 @(private)
@@ -528,6 +562,7 @@ attach :: proc(ls: ^Live_Session, c: ^Conn, req: json.Value) {
 		model:    string,
 		cwd:      string,
 		instructions: []string,
+		permission: json.Value `json:"permission,omitempty"`,
 		running:  bool,
 		messages: []agent.Agent_Message,
 		req:      json.Value `json:"req,omitempty"`,
@@ -538,6 +573,7 @@ attach :: proc(ls: ^Live_Session, c: ^Conn, req: json.Value) {
 		model = ls.cfg.model.id,
 		cwd = ls.cwd,
 		instructions = ls.instructions,
+		permission = rpc.pending_permission(&ls.srv),
 		running = sync.atomic_load(&ls.srv.running),
 		messages = messages,
 		req = req,
