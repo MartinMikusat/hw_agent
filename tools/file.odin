@@ -67,6 +67,7 @@ write_tool :: proc(state: ^File_Tool_State) -> agent.Tool_Definition {
 		name = "write",
 		description = "Write a file, creating parent directories as needed.",
 		parameters_json = WRITE_SCHEMA,
+		sequential = true,
 		execute = write_execute,
 		userdata = state,
 	}
@@ -77,9 +78,27 @@ edit_tool :: proc(state: ^File_Tool_State) -> agent.Tool_Definition {
 		name = "edit",
 		description = "Replace exact text in a file.",
 		parameters_json = EDIT_SCHEMA,
+		sequential = true,
 		execute = edit_execute,
 		userdata = state,
 	}
+}
+
+MAX_READ_BYTES :: 16 * 1024 * 1024
+
+// read_file reads a whole file into temp memory, refusing one too large to hold.
+read_file :: proc(path: string) -> (data: []u8, err: string) {
+	handle, open_error := os.open(path)
+	if open_error != nil { return nil, fmt.tprintf("%v", open_error) }
+	size, size_error := os.file_size(handle)
+	os.close(handle)
+	if size_error != nil { return nil, fmt.tprintf("%v", size_error) }
+	if size > MAX_READ_BYTES {
+		return nil, fmt.tprintf("the file is %d bytes, over the %d byte limit; use bash (head, sed -n, grep) for part of it", size, MAX_READ_BYTES)
+	}
+	contents, read_error := os.read_entire_file(path, context.temp_allocator)
+	if read_error != nil { return nil, fmt.tprintf("%v", read_error) }
+	return contents, ""
 }
 
 resolve_path :: proc(state: ^File_Tool_State, path: string) -> string {
@@ -141,9 +160,9 @@ read_execute :: proc(
 		return {text = `missing required argument "path"`, is_error = true}
 	}
 	full := resolve_path(state, path)
-	data, rerr := os.read_entire_file(full, context.allocator)
-	if rerr != nil {
-		return {text = fmt.tprintf("cannot read %s: %v", path, rerr), is_error = true}
+	data, rerr := read_file(full)
+	if rerr != "" {
+		return {text = fmt.tprintf("cannot read %s: %s", path, rerr), is_error = true}
 	}
 
 	text := string(data)
@@ -153,7 +172,7 @@ read_execute :: proc(
 		return {text = text}
 	}
 
-	lines := strings.split_lines(text)
+	lines := strings.split_lines(text, context.temp_allocator)
 	start := max(offset - 1, 0)
 	if start >= len(lines) {
 		return {text = fmt.tprintf("offset %d past end of file (%d lines)", offset, len(lines)), is_error = true}
@@ -162,7 +181,7 @@ read_execute :: proc(
 	if has_limit && limit > 0 {
 		end = min(start + limit, end)
 	}
-	out := strings.builder_make()
+	out := strings.builder_make(context.temp_allocator)
 	for line, i in lines[start:end] {
 		strings.write_string(&out, fmt.tprintf("%d\t%s\n", start + i + 1, line))
 	}
@@ -223,9 +242,9 @@ edit_execute :: proc(
 		return {text = `missing required argument "old_string"`, is_error = true}
 	}
 	full := resolve_path(state, path)
-	data, rerr := os.read_entire_file(full, context.allocator)
-	if rerr != nil {
-		return {text = fmt.tprintf("cannot read %s: %v", path, rerr), is_error = true}
+	data, rerr := read_file(full)
+	if rerr != "" {
+		return {text = fmt.tprintf("cannot read %s: %s", path, rerr), is_error = true}
 	}
 	text := string(data)
 	count := strings.count(text, old_s)
@@ -240,7 +259,7 @@ edit_execute :: proc(
 		}
 	}
 	n := replace_all ? -1 : 1
-	replaced, _ := strings.replace(text, old_s, new_s, n, context.allocator)
+	replaced, _ := strings.replace(text, old_s, new_s, n, context.temp_allocator)
 	if werr := os.write_entire_file(full, transmute([]u8)replaced); werr != nil {
 		return {text = fmt.tprintf("cannot write %s: %v", path, werr), is_error = true}
 	}

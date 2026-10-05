@@ -54,6 +54,7 @@ Tool_Definition :: struct {
 	parameters_json: string, // JSON Schema object as text
 	sequential:      bool,   // force sequential execution within a batch
 	max_output_bytes: int,
+	// execute may return temp-allocated text: the loop copies it.
 	execute:         proc(
 		call_id: string,
 		args: json.Value,

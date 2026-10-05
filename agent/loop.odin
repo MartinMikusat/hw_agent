@@ -4,6 +4,7 @@ package agent
 // calls and steering messages inside an outer loop that drains the
 // follow-up queue when the run would otherwise settle.
 
+import "base:runtime"
 import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
@@ -13,6 +14,7 @@ import "core:thread"
 import "core:time"
 
 import "../ai"
+import "../textutil"
 
 TOOL_OUTPUT_MAX_CHARS :: 30_000
 MAX_TURNS :: 200 // hard bound on inner iterations per run; defensive, not a feature
@@ -44,6 +46,7 @@ run :: proc(
 
 	for p in prompts {
 		msg := p
+		msg.text = textutil.scrub(msg.text, allocator)
 		if msg.timestamp == 0 { msg.timestamp = time.to_unix_seconds(time.now()) }
 		append(&ctx.messages, msg)
 		emit(Event_Message_Start{message = &ctx.messages[len(ctx.messages) - 1]}, emit_userdata)
@@ -65,6 +68,7 @@ run :: proc(
 			}
 			for p in pending {
 				msg := p
+				msg.text = textutil.scrub(msg.text, allocator)
 				if msg.timestamp == 0 { msg.timestamp = time.to_unix_seconds(time.now()) }
 				append(&ctx.messages, msg)
 				emit(Event_Message_Start{message = &ctx.messages[len(ctx.messages) - 1]}, emit_userdata)
@@ -448,8 +452,12 @@ all_continue :: proc(jobs: []Tool_Job) -> bool {
 	return true
 }
 
+// run_tool executes one call. A tool may return text from the temp allocator
+// (a worker thread's is freed when it exits); the result is always copied to
+// allocator, made valid UTF-8 and capped on a character boundary here.
 run_tool :: proc(tool: ^Tool_Definition, call: ai.Tool_Call, cancel: ^ai.Cancellation, allocator: mem.Allocator) -> Tool_Result {
-	args, perr := json.parse_string(call.arguments, .JSON, false, allocator)
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	args, perr := json.parse_string(call.arguments, .JSON, false, context.temp_allocator)
 	if perr != nil {
 		return Tool_Result{text = fmt.aprintf("Invalid tool arguments: %v", perr, allocator = allocator), is_error = true}
 	}
@@ -458,12 +466,10 @@ run_tool :: proc(tool: ^Tool_Definition, call: ai.Tool_Call, cancel: ^ai.Cancell
 	result.duration_ms = i64(time.duration_milliseconds(time.tick_since(started)))
 	output_limit := tool.max_output_bytes > 0 ? tool.max_output_bytes : TOOL_OUTPUT_MAX_CHARS
 	if len(result.text) > output_limit {
-		result.text = fmt.aprintf(
-			"%s\n[output truncated at %d chars]",
-			result.text[:output_limit],
-			output_limit,
-			allocator = allocator,
-		)
+		kept := textutil.scrub(textutil.cut(result.text, output_limit), context.temp_allocator)
+		result.text = fmt.aprintf("%s\n[output truncated at %d chars]", kept, output_limit, allocator = allocator)
+	} else {
+		result.text = textutil.clean(result.text, allocator)
 	}
 	return result
 }

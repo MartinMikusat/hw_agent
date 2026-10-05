@@ -16,6 +16,7 @@ import "core:sync"
 import "core:thread"
 import "core:time"
 import devlog "devlog:."
+import "../textutil"
 import "core:unicode/utf8"
 
 CURL_URL :: "https://openrouter.ai/api/v1/chat/completions"
@@ -637,7 +638,7 @@ capture_http_error :: proc(impl: ^OpenAI_Stream, line: string) {
 	err_obj, is_err := obj["error"].(json.Object)
 	if !is_err { return }
 	msg, _ := err_obj["message"].(json.String)
-	impl.http_message = strings.clone(string(msg)[:min(len(msg), MAX_ERROR_DETAIL)], impl.allocator)
+	impl.http_message = textutil.clean(textutil.cut(string(msg), MAX_ERROR_DETAIL), impl.allocator)
 	#partial switch code in err_obj["code"] {
 	case json.Integer: impl.http_code = i32(code)
 	case json.Float:   impl.http_code = i32(code)
@@ -730,8 +731,8 @@ handle_sse_line :: proc(impl: ^OpenAI_Stream, line: string) -> (Event, bool) {
 				msg = string(s)
 			}
 			impl.cause = "provider reported a stream error"
-			impl.http_message = strings.clone(msg[:min(len(msg), MAX_ERROR_DETAIL)], impl.allocator)
-			return stream_error(impl, strings.clone(msg, impl.allocator)), true
+			impl.http_message = textutil.clean(textutil.cut(msg, MAX_ERROR_DETAIL), impl.allocator)
+			return stream_error(impl, textutil.clean(msg, impl.allocator)), true
 		}
 	}
 
@@ -765,34 +766,37 @@ handle_sse_line :: proc(impl: ^OpenAI_Stream, line: string) -> (Event, bool) {
 
 	if cv, has := delta["content"]; has {
 		if s, sok := cv.(json.String); sok && len(s) > 0 {
+			text := textutil.scrub(string(s), impl.allocator)
 			if len(impl.partial.text) == 0 {
 				impl.text_buf = strings.builder_make(impl.allocator)
 			}
-			strings.write_string(&impl.text_buf, string(s))
+			strings.write_string(&impl.text_buf, text)
 			impl.partial.text = strings.to_string(impl.text_buf)
-			queue_delta(impl, .Text_Delta, string(s))
+			queue_delta(impl, .Text_Delta, text)
 		}
 	}
 
 	if rv, has := delta["reasoning"]; has {
 		if s, sok := rv.(json.String); sok && len(s) > 0 {
+			text := textutil.scrub(string(s), impl.allocator)
 			if len(impl.partial.thinking) == 0 {
 				impl.thinking_buf = strings.builder_make(impl.allocator)
 			}
-			strings.write_string(&impl.thinking_buf, string(s))
+			strings.write_string(&impl.thinking_buf, text)
 			impl.partial.thinking = strings.to_string(impl.thinking_buf)
-			queue_delta(impl, .Thinking_Delta, string(s))
+			queue_delta(impl, .Thinking_Delta, text)
 		}
 	}
 	if rv, has := delta["reasoning_content"]; has {
 		if _, has_reasoning := delta["reasoning"]; !has_reasoning {
 			if s, sok := rv.(json.String); sok && len(s) > 0 {
+				text := textutil.scrub(string(s), impl.allocator)
 				if len(impl.partial.thinking) == 0 {
 					impl.thinking_buf = strings.builder_make(impl.allocator)
 				}
-				strings.write_string(&impl.thinking_buf, string(s))
+				strings.write_string(&impl.thinking_buf, text)
 				impl.partial.thinking = strings.to_string(impl.thinking_buf)
-				queue_delta(impl, .Thinking_Delta, string(s))
+				queue_delta(impl, .Thinking_Delta, text)
 			}
 		}
 	}
@@ -829,20 +833,21 @@ handle_sse_line :: proc(impl: ^OpenAI_Stream, line: string) -> (Event, bool) {
 				meta := &impl.call_meta[idx]
 				if idv, has := tc["id"]; has {
 					if s, sok := idv.(json.String); sok {
-						meta.id = strings.clone(string(s), impl.allocator)
+						meta.id = textutil.clean(string(s), impl.allocator)
 					}
 				}
 				if fnv, has := tc["function"]; has {
 					if fn, fok := fnv.(json.Object); fok {
 						if nv, has := fn["name"]; has {
 							if s, sok := nv.(json.String); sok {
-								meta.name = strings.clone(string(s), impl.allocator)
+								meta.name = textutil.clean(string(s), impl.allocator)
 							}
 						}
 						if av, has := fn["arguments"]; has {
 							if s, sok := av.(json.String); sok {
-								strings.write_string(&impl.arg_bufs[idx], string(s))
-								queue_delta(impl, .Tool_Call_Delta, string(s))
+								text := textutil.scrub(string(s), impl.allocator)
+								strings.write_string(&impl.arg_bufs[idx], text)
+								queue_delta(impl, .Tool_Call_Delta, text)
 							}
 						}
 					}

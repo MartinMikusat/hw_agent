@@ -67,6 +67,10 @@ test_output_status_directory_and_sigpipe :: proc(t: ^testing.T) {
 	text, _, _ = run_bash("true")
 	testing.expect_value(t, text, "(no output)")
 
+	// a stray byte or a cut character must not leave the output unencodable
+	text, _, _ = run_bash(`printf 'a\377b\342\202'`)
+	testing.expect_value(t, text, "a\uFFFDb\uFFFD\uFFFD")
+
 	// the daemon ignores SIGPIPE; a child must get the default back
 	posix.signal(.SIGPIPE, auto_cast posix.SIG_IGN)
 	text, is_error, elapsed = run_bash("yes | head -n 1")

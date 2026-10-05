@@ -11,6 +11,7 @@ import "core:os"
 import "core:strings"
 
 import devlog "devlog:."
+import "../textutil"
 
 MAX_FILE_BYTES :: 32 * 1024
 GLOBAL_FILE :: ".agents/AGENTS.md" // under the home directory
@@ -70,14 +71,10 @@ add :: proc(sources: ^[dynamic]Source, path: string, allocator := context.alloca
 		devlog.failed(devlog.global(), {feature = "instructions", operation = "load"}, {reason = "instruction file could not be read", detail = basename(path), severity = .Warning})
 		return true
 	}
-	text := strings.trim_space(string(data))
+	text := textutil.scrub(strings.trim_space(string(data)), context.temp_allocator)
 	if len(text) == 0 { return true }
 	truncated := len(text) > MAX_FILE_BYTES
-	if truncated {
-		cut := MAX_FILE_BYTES
-		for cut > 0 && text[cut] & 0xC0 == 0x80 { cut -= 1 } // keep UTF-8 whole
-		text = text[:cut]
-	}
+	if truncated { text = textutil.cut(text, MAX_FILE_BYTES) }
 	append(sources, Source {
 		path = strings.clone(path, allocator),
 		text = truncated ? strings.concatenate({text, "\n[truncated]"}, allocator) : strings.clone(text, allocator),

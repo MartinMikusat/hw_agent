@@ -5,10 +5,15 @@ package agent
 // the tool round-trip, steering injection, follow-up drain, before_tool_call
 // blocking, and abort — the full Loop_Config seam surface.
 
+import "base:runtime"
 import "core:encoding/json"
+import "core:fmt"
 import "core:mem"
+import "core:strings"
 import "core:sync"
 import "core:testing"
+import "core:time"
+import "core:unicode/utf8"
 
 import "../ai"
 
@@ -170,7 +175,7 @@ test_tool_round_trip :: proc(t: ^testing.T) {
 	ctx, cfg := rig_ctx(f, context.temp_allocator)
 	cancel := ai.Cancellation{}
 
-	err := run(ctx, cfg, {{role = .User, text = "go"}}, noop_emit, nil, &cancel, context.temp_allocator)
+	err := run(ctx, cfg, {{role = .User, text = "go"}}, noop_emit, nil, &cancel, runtime.heap_allocator())
 	testing.expect_value(t, err, Error.None)
 	testing.expect_value(t, len(f.tools_ran), 1)
 	testing.expect_value(t, f.tools_ran[0], "c1")
@@ -195,7 +200,7 @@ test_steering_and_followup :: proc(t: ^testing.T) {
 	ctx, cfg := rig_ctx(f, context.temp_allocator)
 	cancel := ai.Cancellation{}
 
-	err := run(ctx, cfg, {{role = .User, text = "go"}}, noop_emit, nil, &cancel, context.temp_allocator)
+	err := run(ctx, cfg, {{role = .User, text = "go"}}, noop_emit, nil, &cancel, runtime.heap_allocator())
 	testing.expect_value(t, err, Error.None)
 
 	// steering drained before first generation → request 1 must contain it
@@ -242,7 +247,7 @@ test_blocked_tool :: proc(t: ^testing.T) {
 	ctx, cfg := rig_ctx(f, context.temp_allocator)
 	cancel := ai.Cancellation{}
 
-	err := run(ctx, cfg, {{role = .User, text = "go"}}, noop_emit, nil, &cancel, context.temp_allocator)
+	err := run(ctx, cfg, {{role = .User, text = "go"}}, noop_emit, nil, &cancel, runtime.heap_allocator())
 	testing.expect_value(t, err, Error.None)
 	testing.expect_value(t, len(f.tools_ran), 0)
 	last := f.contexts[1][len(f.contexts[1]) - 1]
@@ -259,7 +264,7 @@ test_abort :: proc(t: ^testing.T) {
 	cancel := ai.Cancellation{}
 	sync.atomic_store(&cancel.flag, true)
 
-	err := run(ctx, cfg, {{role = .User, text = "go"}}, noop_emit, nil, &cancel, context.temp_allocator)
+	err := run(ctx, cfg, {{role = .User, text = "go"}}, noop_emit, nil, &cancel, runtime.heap_allocator())
 	testing.expect_value(t, err, Error.Aborted)
 }
 
@@ -276,7 +281,7 @@ test_failed_tool_stream_followup :: proc(t: ^testing.T) {
 		ctx, cfg := rig_ctx(f, context.temp_allocator)
 		cancel := ai.Cancellation{}
 
-		err := run(ctx, cfg, {{role = .User, text = "go"}}, noop_emit, nil, &cancel, context.temp_allocator)
+		err := run(ctx, cfg, {{role = .User, text = "go"}}, noop_emit, nil, &cancel, runtime.heap_allocator())
 		testing.expect_value(t, err, reason == .Aborted ? Error.Aborted : Error.Stream_Failed)
 		testing.expect_value(t, len(f.tools_ran), 1)
 		testing.expect_value(t, f.tools_ran[0], "complete")
@@ -286,7 +291,7 @@ test_failed_tool_stream_followup :: proc(t: ^testing.T) {
 		testing.expect_value(t, failed.thinking, "partial trace")
 		testing.expect_value(t, failed.usage, usage)
 
-		err = run(ctx, cfg, {{role = .User, text = "try again"}}, noop_emit, nil, &cancel, context.temp_allocator)
+		err = run(ctx, cfg, {{role = .User, text = "try again"}}, noop_emit, nil, &cancel, runtime.heap_allocator())
 		testing.expect_value(t, err, Error.None)
 		testing.expect_value(t, len(f.tools_ran), 1)
 		testing.expect_value(t, len(f.contexts), 3)
@@ -298,4 +303,86 @@ test_failed_tool_stream_followup :: proc(t: ^testing.T) {
 		testing.expect_value(t, request[2].text, "fake-out")
 		testing.expect_value(t, len(request[3].tool_calls), 0)
 	}
+}
+
+// ---- tool result hygiene and ordering ----
+// run's allocator holds results beyond the call, so it must not be the temp allocator.
+
+poison_tool :: proc(call_id: string, args: json.Value, cancel: ^ai.Cancellation, on_update: proc(text: string, userdata: rawptr), userdata: rawptr) -> Tool_Result {
+	// temp-allocated (a worker thread's is freed when it exits), invalid UTF-8 inside
+	raw := [4]u8{0xff, 0xfe, 0xe2, 0x82}
+	return {text = fmt.tprintf("bad:%s:%s:end", string(raw[:]), call_id)}
+}
+
+seq_log: [dynamic]string
+seq_mu: sync.Mutex
+
+seq_first :: proc(call_id: string, args: json.Value, cancel: ^ai.Cancellation, on_update: proc(text: string, userdata: rawptr), userdata: rawptr) -> Tool_Result {
+	time.sleep(60 * time.Millisecond)
+	sync.mutex_lock(&seq_mu)
+	append(&seq_log, "first")
+	sync.mutex_unlock(&seq_mu)
+	return {text = "one"}
+}
+
+seq_second :: proc(call_id: string, args: json.Value, cancel: ^ai.Cancellation, on_update: proc(text: string, userdata: rawptr), userdata: rawptr) -> Tool_Result {
+	sync.mutex_lock(&seq_mu)
+	append(&seq_log, "second")
+	sync.mutex_unlock(&seq_mu)
+	return {text = "two"}
+}
+
+call3 :: proc(name: string, allocator: mem.Allocator) -> []ai.Tool_Call {
+	calls := make([]ai.Tool_Call, 3, allocator)
+	for i in 0 ..< 3 { calls[i] = {id = fmt.aprintf("c%d", i, allocator = allocator), name = name, arguments = `{}`} }
+	return calls
+}
+
+@(test)
+test_tool_results_are_valid_utf8_and_outlive_their_thread :: proc(t: ^testing.T) {
+	// 40 parallel batches: a result still pointing into a dead thread's temp memory would corrupt
+	for round in 0 ..< 40 {
+		f := new_rig([]ai.Message{
+			{role = .Assistant, tool_calls = call3("poison", context.temp_allocator), stop_reason = .Tool_Calls},
+			{role = .Assistant, text = "done", stop_reason = .Stop},
+		}, context.temp_allocator)
+		ctx, cfg := rig_ctx(f, context.temp_allocator)
+		ctx.tools = []Tool_Definition{{name = "poison", parameters_json = `{"type":"object"}`, execute = poison_tool}}
+		cancel := ai.Cancellation{}
+		testing.expect_value(t, run(ctx, cfg, {{role = .User, text = "go"}}, noop_emit, nil, &cancel, runtime.heap_allocator()), Error.None)
+		results := 0
+		for m in ctx.messages {
+			if m.role != .Tool_Result { continue }
+			results += 1
+			testing.expect(t, utf8.valid_string(m.text), "tool result must be valid UTF-8")
+			testing.expect(t, strings.has_prefix(m.text, "bad:����:c") && strings.has_suffix(m.text, ":end"), m.text)
+		}
+		testing.expect_value(t, results, 3)
+		if round == 0 {
+			// the model sees the cleaned text too
+			testing.expect(t, utf8.valid_string(f.contexts[1][len(f.contexts[1]) - 1].text))
+		}
+	}
+}
+
+@(test)
+test_sequential_tools_run_in_call_order :: proc(t: ^testing.T) {
+	clear(&seq_log)
+	defer delete(seq_log)
+	calls := make([]ai.Tool_Call, 2, context.temp_allocator)
+	calls[0] = {id = "a", name = "first", arguments = `{}`}
+	calls[1] = {id = "b", name = "second", arguments = `{}`}
+	f := new_rig([]ai.Message{
+		{role = .Assistant, tool_calls = calls, stop_reason = .Tool_Calls},
+		{role = .Assistant, text = "done", stop_reason = .Stop},
+	}, context.temp_allocator)
+	ctx, cfg := rig_ctx(f, context.temp_allocator)
+	ctx.tools = []Tool_Definition{
+		{name = "first", parameters_json = `{"type":"object"}`, sequential = true, execute = seq_first},
+		{name = "second", parameters_json = `{"type":"object"}`, sequential = true, execute = seq_second},
+	}
+	cancel := ai.Cancellation{}
+	testing.expect_value(t, run(ctx, cfg, {{role = .User, text = "go"}}, noop_emit, nil, &cancel, runtime.heap_allocator()), Error.None)
+	testing.expect_value(t, len(seq_log), 2)
+	testing.expect(t, seq_log[0] == "first" && seq_log[1] == "second", "the slow first call must finish before the second starts")
 }

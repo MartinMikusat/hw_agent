@@ -6,6 +6,7 @@ package session
 // needs them. Writes go straight to the fd on every entry — a crash loses at
 // most the in-flight generation, never committed history.
 
+import "base:runtime"
 import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
@@ -64,14 +65,18 @@ open :: proc(path: string, allocator: mem.Allocator) -> (^Session, []agent.Agent
 	s.allocator = allocator
 
 	messages := make([dynamic]agent.Agent_Message, 0, 64, allocator)
+	info := Replay_Info{torn_at = -1}
 	if os.exists(path) {
-		if err := replay_into(s, path, &messages); err != nil {
+		replayed, err := replay_into(s, path, &messages)
+		if err != nil {
 			devlog.failed(devlog.global(), {feature = "session", operation = "open"}, {
 				reason = err == os.General_Error.Invalid_File ? "session log is corrupt" : "session log could not be read",
 				detail = basename(path),
+				code = i32(replayed.bad_line),
 			})
 			return nil, nil, err
 		}
+		info = replayed
 	}
 
 	file, oerr := os.open(path, {.Write, .Create, .Append}, os.perm(0o600))
@@ -80,6 +85,14 @@ open :: proc(path: string, allocator: mem.Allocator) -> (^Session, []agent.Agent
 		return nil, nil, oerr
 	}
 	s.file = file
+	// Resume on a clean line boundary: drop a half-written last entry, and end a
+	// last entry that lacks its newline, so the next append cannot fuse with it.
+	if info.torn_at >= 0 {
+		_ = os.truncate(file, i64(info.torn_at))
+		devlog.failed(devlog.global(), {feature = "session", operation = "open"}, {reason = "session log ended in a half-written entry, which was dropped", severity = .Warning, detail = basename(path)})
+	} else if info.missing_newline {
+		_, _ = os.write(file, {'\n'})
+	}
 	return s, messages[:], nil
 }
 
@@ -88,48 +101,77 @@ open :: proc(path: string, allocator: mem.Allocator) -> (^Session, []agent.Agent
 replay :: proc(path: string, allocator: mem.Allocator) -> (messages: []agent.Agent_Message, model: string, err: os.Error) {
 	s := Session{allocator = allocator}
 	list := make([dynamic]agent.Agent_Message, 0, 64, allocator)
-	err = replay_into(&s, path, &list)
+	_, err = replay_into(&s, path, &list)
 	return list[:], s.model, err
 }
 
+// Replay_Info describes how the log ended. torn_at is the byte offset of a
+// half-written last entry (-1 when the log is whole); bad_line is the 1-based
+// line of corruption that is not at the end.
+Replay_Info :: struct {
+	torn_at:         int,
+	missing_newline: bool,
+	bad_line:        int,
+}
+
 @(private)
-replay_into :: proc(s: ^Session, path: string, messages: ^[dynamic]agent.Agent_Message) -> os.Error {
+replay_into :: proc(s: ^Session, path: string, messages: ^[dynamic]agent.Agent_Message) -> (info: Replay_Info, err: os.Error) {
+	info.torn_at = -1
 	allocator := s.allocator
 	data, rerr := os.read_entire_file(path, allocator)
 	if rerr != nil {
-		return rerr
+		return info, rerr
 	}
 	text := string(data)
-	for line in strings.split_lines_iterator(&text) {
-		if len(strings.trim_space(line)) == 0 {
-			continue
-		}
-		entry: Entry
-		if uerr := json.unmarshal(transmute([]u8)line, &entry, .JSON, allocator); uerr != nil {
-			return os.General_Error.Invalid_File // malformed entry — refuse to resume over corruption
-		}
-		#partial switch entry.kind {
-		case .Message:
-			append(messages, entry.message)
-		case .Compaction:
-			// Self-contained: reset replay to summary + retained tail.
-			// Later entries append on top; earlier ones are dropped.
-			clear(messages)
-			append(messages, agent.Agent_Message {
-				role = .Compaction_Summary,
-				text = entry.summary,
-			})
-			for m in entry.tail {
-				append(messages, m)
+	position, line_number := 0, 0
+	for position < len(text) {
+		newline := strings.index_byte(text[position:], '\n')
+		line_end := newline < 0 ? len(text) : position + newline
+		next := newline < 0 ? len(text) : line_end + 1
+		line_number += 1
+		line := text[position:line_end]
+		if len(strings.trim_space(line)) > 0 {
+			entry: Entry
+			if uerr := json.unmarshal(transmute([]u8)line, &entry, .JSON, allocator); uerr != nil {
+				// A damaged final entry is a torn write; damage anywhere else is corruption,
+				// and resuming over it would silently drop history.
+				if len(strings.trim_space(text[next:])) == 0 {
+					info.torn_at = position
+					return info, nil
+				}
+				info.bad_line = line_number
+				return info, os.General_Error.Invalid_File
 			}
-		case .Header:
-			s.model = entry.model
-			s.cwd = entry.cwd
+			info.missing_newline = newline < 0
+			apply_entry(s, entry, messages)
 		}
-		s.tip_id = entry.id
-		s.next_seq = entry.seq + 1
+		position = next
 	}
-	return nil
+	return info, nil
+}
+
+@(private)
+apply_entry :: proc(s: ^Session, entry: Entry, messages: ^[dynamic]agent.Agent_Message) {
+	#partial switch entry.kind {
+	case .Message:
+		append(messages, entry.message)
+	case .Compaction:
+		// Self-contained: reset replay to summary + retained tail.
+		// Later entries append on top; earlier ones are dropped.
+		clear(messages)
+		append(messages, agent.Agent_Message {
+			role = .Compaction_Summary,
+			text = entry.summary,
+		})
+		for m in entry.tail {
+			append(messages, m)
+		}
+	case .Header:
+		s.model = entry.model
+		s.cwd = entry.cwd
+	}
+	s.tip_id = entry.id
+	s.next_seq = entry.seq + 1
 }
 
 close :: proc(s: ^Session) {
@@ -189,17 +231,27 @@ append_header :: proc(s: ^Session, model, cwd: string) -> os.Error {
 
 @(private)
 write_entry :: proc(s: ^Session, entry: Entry) -> os.Error {
-	line, merr := json.marshal(entry, {}, s.allocator)
+	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
+	line, merr := json.marshal(entry, {}, context.temp_allocator)
 	if merr != nil {
 		return os.General_Error.Invalid_File
 	}
-	buf := make([dynamic]u8, 0, len(line) + 1, s.allocator)
-	append(&buf, ..line)
-	append(&buf, '\n')
-	if _, werr := os.write(s.file, buf[:]); werr != nil {
-		return werr
+	buf := make([]u8, len(line) + 1, context.temp_allocator)
+	copy(buf, line)
+	buf[len(line)] = '\n'
+	before, _ := os.file_size(s.file)
+	rest := buf
+	for len(rest) > 0 {
+		n, werr := os.write(s.file, rest)
+		if werr != nil || n <= 0 {
+			_ = os.truncate(s.file, before) // never leave half an entry in the log
+			return werr != nil ? werr : os.General_Error.Invalid_File
+		}
+		rest = rest[n:]
 	}
+	previous := s.tip_id
 	s.tip_id = entry.id
+	if len(previous) > 0 { delete(previous, s.allocator) }
 	s.next_seq += 1
 	return nil
 }

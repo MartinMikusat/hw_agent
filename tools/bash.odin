@@ -17,6 +17,7 @@ import devlog "devlog:."
 
 import "../agent"
 import "../ai"
+import "../textutil"
 
 BASH_DEFAULT_TIMEOUT_S :: 120
 BASH_MAX_TIMEOUT_S :: 3600
@@ -47,6 +48,7 @@ bash_tool :: proc(working_dir: string, allocator := context.allocator) -> agent.
 		description = "Execute a bash command and return its combined stdout/stderr output (the last 30000 bytes when longer). Commands run for at most the timeout, and background processes are stopped when the command exits.",
 		parameters_json = BASH_SCHEMA,
 		max_output_bytes = BASH_MAX_OUTPUT_BYTES,
+		sequential = true,
 		execute = bash_execute,
 		userdata = state,
 	}
@@ -237,10 +239,11 @@ bash_execute :: proc(
 	}
 
 	out := strings.builder_make(context.temp_allocator)
+	output := textutil.scrub(string(buffer[:]), context.temp_allocator) // the tail may start inside a character
 	if dropped > 0 {
 		fmt.sbprintf(&out, "[earlier output omitted: %d bytes]\n", dropped)
 	}
-	strings.write_string(&out, strings.trim_right(string(buffer[:]), "\n"))
+	strings.write_string(&out, strings.trim_right(output, "\n"))
 	if len(buffer) == 0 && dropped == 0 {
 		strings.write_string(&out, "(no output)")
 	}
@@ -265,6 +268,6 @@ bash_execute :: proc(
 			strings.write_string(&out, "\n[background processes were stopped when the command exited]")
 		}
 	}
-	return {text = strings.clone(strings.to_string(out)), is_error = failed}
+	return {text = strings.to_string(out), is_error = failed}
 }
 

@@ -53,6 +53,7 @@ import "core:time"
 import "../agent"
 import "../ai"
 import "../permissions"
+import "../textutil"
 
 Server :: struct {
 	ctx:       ^agent.Context,
@@ -248,7 +249,7 @@ handle_command :: proc(srv: ^Server, v: json.Value) {
 	raw_text, _ := obj["text"].(json.String)
 	// raw_text lives in the reader's temp_allocator, freed after this proc —
 	// clone into the server's allocator before it can reach a queue.
-	text := strings.clone(string(raw_text), srv.allocator)
+	text := textutil.clean(string(raw_text), srv.allocator)
 	switch cmd {
 	case "prompt":
 		if sync.atomic_load(&srv.running) {
@@ -307,6 +308,10 @@ emit_line :: proc(sink: ^Line_Sink, type: string, fields: map[string]json.Value)
 	runtime.DEFAULT_TEMP_ALLOCATOR_TEMP_GUARD()
 	fields := fields
 	defer delete(fields)
+	for key, value in fields {
+		// last guard: invalid UTF-8 would make the line invalid JSON for every client
+		if s, is_string := value.(json.String); is_string { fields[key] = json.String(textutil.scrub(string(s), context.temp_allocator)) }
+	}
 	fields["type"] = type
 	if sink != nil && len(sink.session) > 0 {
 		fields["session"] = sink.session
