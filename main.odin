@@ -4,6 +4,7 @@ package main
 // Streams the run to stdout — text deltas raw, tool boundaries marked.
 
 import "core:fmt"
+import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:time"
@@ -11,6 +12,7 @@ import "core:time"
 import "agent"
 import "ai"
 import "compact"
+import "keychain"
 import "rpc"
 import "session"
 import "tools"
@@ -22,14 +24,25 @@ SYSTEM_PROMPT :: `You are a coding agent running inside hw_agent, a minimal harn
 Use the bash tool to inspect the environment and complete the user's task.
 Be concise.`
 
+USAGE :: `usage: hw_agent "<prompt>" [-model=<id>] [-session=<path>]
+       hw_agent -rpc [-model=<id>] [-session=<path>]
+       hw_agent -serve [-model=<id>]       shared daemon on the agent socket
+       hw_agent -install [-model=<id>]     LaunchAgent for -serve + Keychain key
+       hw_agent -uninstall`
+
+API_KEY_ENV :: "OPENROUTER_API_KEY"
+
 main :: proc() {
 	model_id := DEFAULT_MODEL
 	session_path := ""
 	prompt := ""
 	rpc_mode := false
+	mode := ""
 	for arg in os.args[1:] {
 		if arg == "-rpc" {
 			rpc_mode = true
+		} else if arg == "-serve" || arg == "-install" || arg == "-uninstall" {
+			mode = arg
 		} else if strings.has_prefix(arg, "-model=") {
 			model_id = arg[7:]
 		} else if strings.has_prefix(arg, "-session=") {
@@ -42,40 +55,33 @@ main :: proc() {
 			}
 		}
 	}
-	if len(prompt) == 0 && !rpc_mode {
-		fmt.eprintln("usage: hw_agent \"<prompt>\" [-model=<id>] [-session=<path>]\n       hw_agent -rpc [-model=<id>] [-session=<path>]")
+	switch mode {
+	case "-install":
+		os.exit(install(model_id))
+	case "-uninstall":
+		os.exit(uninstall())
+	}
+	if len(prompt) == 0 && !rpc_mode && mode == "" {
+		fmt.eprintln(USAGE)
 		os.exit(1)
 	}
 
-	api_key := os.get_env("OPENROUTER_API_KEY", context.allocator)
+	api_key := os.get_env(API_KEY_ENV, context.allocator)
+	if len(api_key) == 0 && mode == "-serve" {
+		api_key, _ = keychain.read(KEYCHAIN_ACCOUNT)
+	}
 	if len(api_key) == 0 {
-		fmt.eprintln("no OpenRouter API key: set OPENROUTER_API_KEY")
+		fmt.eprintln("no OpenRouter API key: set OPENROUTER_API_KEY (or run -install to store it in the Keychain)")
 		os.exit(1)
 	}
 
-	cwd, _ := os.get_working_directory(context.allocator)
-	file_state := tools.file_tool_state(cwd)
-	tool_list := []agent.Tool_Definition {
-		tools.bash_tool(cwd),
-		tools.read_tool(file_state),
-		tools.write_tool(file_state),
-		tools.edit_tool(file_state),
+	cfg := base_config(model_id, api_key)
+	if mode == "-serve" {
+		os.exit(serve_daemon(cfg))
 	}
-
 	ctx := agent.Context {
 		system_prompt = SYSTEM_PROMPT,
-		tools = tool_list,
-	}
-	cfg := agent.Loop_Config {
-		model = ai.Model {
-			id = model_id,
-			context_window = DEFAULT_CONTEXT_WINDOW,
-			max_output = 16_000,
-		},
-		stream = ai.stream_openai,
-		api_key = api_key,
-		compact = compact.maybe_compact,
-		transform_context = compact.prune,
+		tools = make_tools(context.allocator),
 	}
 	cancel := ai.Cancellation{}
 
@@ -122,6 +128,32 @@ main :: proc() {
 		fmt.eprintfln("run failed: %v", err)
 		os.exit(1)
 	}
+}
+
+base_config :: proc(model_id, api_key: string) -> agent.Loop_Config {
+	return {
+		model = ai.Model {
+			id = model_id,
+			context_window = DEFAULT_CONTEXT_WINDOW,
+			max_output = 16_000,
+		},
+		stream = ai.stream_openai,
+		api_key = api_key,
+		compact = compact.maybe_compact,
+		transform_context = compact.prune,
+	}
+}
+
+// Tools resolve paths against the process working directory.
+make_tools :: proc(allocator: mem.Allocator) -> []agent.Tool_Definition {
+	cwd, _ := os.get_working_directory(allocator)
+	file_state := tools.file_tool_state(cwd, allocator)
+	list := make([]agent.Tool_Definition, 4, allocator)
+	list[0] = tools.bash_tool(cwd, allocator)
+	list[1] = tools.read_tool(file_state)
+	list[2] = tools.write_tool(file_state)
+	list[3] = tools.edit_tool(file_state)
+	return list
 }
 
 print_sink :: proc(event: agent.Event, userdata: rawptr) {

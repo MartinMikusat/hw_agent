@@ -29,6 +29,7 @@ test_append_reopen_replays :: proc(t: ^testing.T) {
 		s, msgs, err := open(path, context.temp_allocator)
 		testing.expect(t, err == nil, "open should succeed")
 		testing.expect_value(t, len(msgs), 0)
+		testing.expect(t, append_header(s, "test/model") == nil)
 		_ = append_message(s, agent.Agent_Message{role = .User, text = "hello"})
 		_ = append_message(s, agent.Agent_Message {
 			role       = .Assistant,
@@ -44,6 +45,7 @@ test_append_reopen_replays :: proc(t: ^testing.T) {
 	defer close(s)
 
 	testing.expect_value(t, len(msgs), 3)
+	testing.expect_value(t, s.model, "test/model")
 	testing.expect_value(t, msgs[0].role, agent.Agent_Role.User)
 	testing.expect_value(t, msgs[0].text, "hello")
 	testing.expect_value(t, msgs[1].role, agent.Agent_Role.Assistant)
@@ -55,8 +57,8 @@ test_append_reopen_replays :: proc(t: ^testing.T) {
 
 	// resume appends continue the chain, not restart it
 	_ = append_message(s, agent.Agent_Message{role = .User, text = "and again"})
-	testing.expect_value(t, s.next_seq, 4)
-	testing.expect_value(t, s.tip_id, "e3")
+	testing.expect_value(t, s.next_seq, 5)
+	testing.expect_value(t, s.tip_id, "e4")
 }
 
 @(test)

@@ -18,6 +18,7 @@ import "../agent"
 Entry_Kind :: enum {
 	Message,
 	Compaction,
+	Header, // first entry of daemon-created sessions
 	// Branch_Summary — reserved; written by a later milestone.
 }
 
@@ -36,6 +37,10 @@ Entry :: struct {
 	files_read:     []string `json:"files_read,omitempty"`,
 	files_modified: []string `json:"files_modified,omitempty"`,
 	tail:           []agent.Agent_Message `json:"tail,omitempty"`,
+
+	// kind == .Header
+	model:   string `json:"model,omitempty"`,
+	created: i64 `json:"created,omitempty"`,
 }
 
 Session :: struct {
@@ -43,6 +48,7 @@ Session :: struct {
 	file:      ^os.File,
 	next_seq:  int,
 	tip_id:    string,
+	model:     string, // from the header entry; "" when absent
 	allocator: mem.Allocator,
 }
 
@@ -56,36 +62,8 @@ open :: proc(path: string, allocator: mem.Allocator) -> (^Session, []agent.Agent
 
 	messages := make([dynamic]agent.Agent_Message, 0, 64, allocator)
 	if os.exists(path) {
-		data, rerr := os.read_entire_file(path, allocator)
-		if rerr != nil {
-			return nil, nil, rerr
-		}
-		text := string(data)
-		for line in strings.split_lines_iterator(&text) {
-			if len(strings.trim_space(line)) == 0 {
-				continue
-			}
-			entry: Entry
-			if uerr := json.unmarshal(transmute([]u8)line, &entry, .JSON, allocator); uerr != nil {
-				return nil, nil, os.General_Error.Invalid_File // malformed entry — refuse to resume over corruption
-			}
-			#partial switch entry.kind {
-			case .Message:
-				append(&messages, entry.message)
-			case .Compaction:
-				// Self-contained: reset replay to summary + retained tail.
-				// Later entries append on top; earlier ones are dropped.
-				clear(&messages)
-				append(&messages, agent.Agent_Message {
-					role = .Compaction_Summary,
-					text = entry.summary,
-				})
-				for m in entry.tail {
-					append(&messages, m)
-				}
-			}
-			s.tip_id = entry.id
-			s.next_seq = entry.seq + 1
+		if err := replay_into(s, path, &messages); err != nil {
+			return nil, nil, err
 		}
 	}
 
@@ -95,6 +73,53 @@ open :: proc(path: string, allocator: mem.Allocator) -> (^Session, []agent.Agent
 	}
 	s.file = file
 	return s, messages[:], nil
+}
+
+// Read-only replay of the log at path, for observers of a live session.
+replay :: proc(path: string, allocator: mem.Allocator) -> ([]agent.Agent_Message, os.Error) {
+	s := Session{allocator = allocator}
+	messages := make([dynamic]agent.Agent_Message, 0, 64, allocator)
+	err := replay_into(&s, path, &messages)
+	return messages[:], err
+}
+
+@(private)
+replay_into :: proc(s: ^Session, path: string, messages: ^[dynamic]agent.Agent_Message) -> os.Error {
+	allocator := s.allocator
+	data, rerr := os.read_entire_file(path, allocator)
+	if rerr != nil {
+		return rerr
+	}
+	text := string(data)
+	for line in strings.split_lines_iterator(&text) {
+		if len(strings.trim_space(line)) == 0 {
+			continue
+		}
+		entry: Entry
+		if uerr := json.unmarshal(transmute([]u8)line, &entry, .JSON, allocator); uerr != nil {
+			return os.General_Error.Invalid_File // malformed entry — refuse to resume over corruption
+		}
+		#partial switch entry.kind {
+		case .Message:
+			append(messages, entry.message)
+		case .Compaction:
+			// Self-contained: reset replay to summary + retained tail.
+			// Later entries append on top; earlier ones are dropped.
+			clear(messages)
+			append(messages, agent.Agent_Message {
+				role = .Compaction_Summary,
+				text = entry.summary,
+			})
+			for m in entry.tail {
+				append(messages, m)
+			}
+		case .Header:
+			s.model = entry.model
+		}
+		s.tip_id = entry.id
+		s.next_seq = entry.seq + 1
+	}
+	return nil
 }
 
 close :: proc(s: ^Session) {
@@ -113,19 +138,7 @@ append_message :: proc(s: ^Session, msg: agent.Agent_Message) -> os.Error {
 		kind      = .Message,
 		message   = msg,
 	}
-	line, merr := json.marshal(entry, {}, s.allocator)
-	if merr != nil {
-		return os.General_Error.Invalid_File
-	}
-	buf := make([dynamic]u8, 0, len(line) + 1, s.allocator)
-	append(&buf, ..line)
-	append(&buf, '\n')
-	if _, werr := os.write(s.file, buf[:]); werr != nil {
-		return werr
-	}
-	s.tip_id = entry.id
-	s.next_seq += 1
-	return nil
+	return write_entry(s, entry)
 }
 
 // Commit a compaction record (self-contained: summary + retained tail).
@@ -143,6 +156,27 @@ append_compaction :: proc(s: ^Session, data: ^agent.Compaction) -> os.Error {
 		files_modified = data.files_modified,
 		tail           = data.tail,
 	}
+	return write_entry(s, entry)
+}
+
+// First entry of a new session: the model it runs on.
+append_header :: proc(s: ^Session, model: string) -> os.Error {
+	assert(s.file != nil)
+	assert(s.next_seq == 0)
+	entry := Entry {
+		id      = fmt.aprintf("e%d", s.next_seq, allocator = s.allocator),
+		seq     = s.next_seq,
+		kind    = .Header,
+		model   = model,
+		created = time.to_unix_seconds(time.now()),
+	}
+	if err := write_entry(s, entry); err != nil { return err }
+	s.model = strings.clone(model, s.allocator)
+	return nil
+}
+
+@(private)
+write_entry :: proc(s: ^Session, entry: Entry) -> os.Error {
 	line, merr := json.marshal(entry, {}, s.allocator)
 	if merr != nil {
 		return os.General_Error.Invalid_File
