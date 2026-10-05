@@ -5,7 +5,8 @@
 //
 //   in:  {"cmd":"list"}                          → {"type":"sessions","sessions":[...]}
 //        {"cmd":"create","model"?:"...","cwd"?:"/abs/dir"}
-//                                                → {"type":"created","session":id,"model","cwd"} (attaches)
+//                                                → {"type":"created","session":id,"model","cwd",
+//                                                  "instructions":[paths loaded into the prompt]} (attaches)
 //        {"cmd":"attach","session":id}           → {"type":"snapshot","session":id,"running":bool,"messages":[...]}
 //                                                  then live events
 //        {"cmd":"detach","session":id}
@@ -46,6 +47,7 @@ import devlog "devlog:."
 
 import "../agent"
 import "../ai"
+import "../instructions"
 import "../rpc"
 import "../session"
 
@@ -55,6 +57,7 @@ Config :: struct {
 	traces_dir:    string, // per-session raw provider traces; "" when tracing is off
 	default_model: string,
 	default_cwd:   string, // for sessions created without one and logs that predate cwd
+	home:          string, // for the global instruction file
 	system_prompt: string,
 	base:          agent.Loop_Config, // per-session copy; model.id is replaced
 	make_tools:    proc(allocator: mem.Allocator, cwd: string) -> []agent.Tool_Definition,
@@ -89,6 +92,7 @@ Live_Session :: struct {
 	id:      string,
 	path:    string,
 	cwd:     string,
+	instructions: []string, // paths of the instruction files in the prompt
 	ctx:     agent.Context,
 	cfg:     agent.Loop_Config,
 	cancel:  ai.Cancellation,
@@ -340,7 +344,9 @@ handle :: proc(d: ^Daemon, c: ^Conn, v: json.Value) {
 		}
 		sync.recursive_mutex_lock(&ls.mu)
 		append(&ls.subs, c)
-		reply(c, req, "created", map[string]json.Value{"session" = ls.id, "model" = ls.cfg.model.id, "cwd" = ls.cwd})
+		loaded := make(json.Array, 0, len(ls.instructions), context.temp_allocator)
+		for p in ls.instructions { append(&loaded, json.Value(p)) }
+		reply(c, req, "created", map[string]json.Value{"session" = ls.id, "model" = ls.cfg.model.id, "cwd" = ls.cwd, "instructions" = loaded})
 		sync.recursive_mutex_unlock(&ls.mu)
 	case "attach":
 		ls, err := live(d, string(id))
@@ -457,8 +463,10 @@ start_session :: proc(d: ^Daemon, id, path, new_model, new_cwd: string) -> (^Liv
 	ls.path = strings.clone(path, a)
 	ls.sess = sess
 	ls.subs = make([dynamic]^Conn, 0, 4, a)
-	ls.ctx.system_prompt = d.cfg.system_prompt
 	ls.cwd = len(sess.cwd) > 0 ? sess.cwd : strings.clone(d.cfg.default_cwd, a)
+	sources := instructions.load(ls.cwd, d.cfg.home, a)
+	ls.instructions = instructions.paths(sources, a)
+	ls.ctx.system_prompt = instructions.render(d.cfg.system_prompt, sources, a)
 	ls.ctx.tools = d.cfg.make_tools(a, ls.cwd)
 	ls.ctx.messages = make([dynamic]agent.Agent_Message, 0, len(messages) + 16, a)
 	append(&ls.ctx.messages, ..messages)
@@ -519,6 +527,7 @@ attach :: proc(ls: ^Live_Session, c: ^Conn, req: json.Value) {
 		session:  string,
 		model:    string,
 		cwd:      string,
+		instructions: []string,
 		running:  bool,
 		messages: []agent.Agent_Message,
 		req:      json.Value `json:"req,omitempty"`,
@@ -528,6 +537,7 @@ attach :: proc(ls: ^Live_Session, c: ^Conn, req: json.Value) {
 		session = ls.id,
 		model = ls.cfg.model.id,
 		cwd = ls.cwd,
+		instructions = ls.instructions,
 		running = sync.atomic_load(&ls.srv.running),
 		messages = messages,
 		req = req,

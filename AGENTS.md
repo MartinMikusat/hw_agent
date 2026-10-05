@@ -27,6 +27,11 @@ frecency shared with fff.nvim.
 - `./build/hw_agent -install [-model=<id>]` / `-uninstall` — LaunchAgent
   `com.halwayland.hw_agent` running `-serve`; requires a stored key
 
+Project instructions (`instructions/`) go into every session's system prompt:
+`~/.agents/AGENTS.md`, then `AGENTS.md` (else `CLAUDE.md`) from the git root down
+to the session's cwd, 32 KB each; `created`/`snapshot` list the files loaded.
+Read when a session starts or resumes, not live.
+
 Daemon sessions each have a working directory (`create` takes `cwd`, default
 the daemon's); tools and the fff index use it. Bump `FFF_REVISION` in
 `scripts/build_fff.sh` to follow a new fff-mcp release.

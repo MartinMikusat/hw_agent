@@ -117,6 +117,7 @@ test_two_clients_share_session :: proc(t: ^testing.T) {
 		default_model = "stub/model",
 		make_tools    = no_tools,
 		default_cwd   = tmp,
+		home          = fmt.aprintf("%s/home", root, allocator = context.temp_allocator),
 		base          = {stream = stub_stream, model = {data = gate, context_window = 100_000}},
 	}
 	d, lerr := listen(cfg, runtime.heap_allocator())
@@ -132,13 +133,17 @@ test_two_clients_share_session :: proc(t: ^testing.T) {
 
 	a := dial(cfg.socket_path)
 	defer posix.close(a.fd)
-	send_line(&a, `{"cmd":"create","req":7}`)
+	_ = os.write_entire_file(fmt.tprintf("%s/AGENTS.md", root), transmute([]u8)string("be brief"))
+	send_line(&a, fmt.tprintf(`{{"cmd":"create","req":7,"cwd":"%s"}}`, root))
 	created := expect_type(&a, "created")
 	if !testing.expect(t, created != nil) { return }
 	testing.expect_value(t, created["req"].(json.Float), 7)
 	id := string(created["session"].(json.String))
 	testing.expect_value(t, string(created["model"].(json.String)), "stub/model")
-	testing.expect_value(t, string(created["cwd"].(json.String)), tmp)
+	testing.expect_value(t, string(created["cwd"].(json.String)), root)
+	loaded := created["instructions"].(json.Array)
+	testing.expect_value(t, len(loaded), 1)
+	testing.expect_value(t, string(loaded[0].(json.String)), fmt.tprintf("%s/AGENTS.md", root))
 
 	send_line(&a, `{"cmd":"create","cwd":"relative/dir"}`)
 	testing.expect_value(t, string(expect_type(&a, "error")["text"].(json.String)), "cwd must be an existing absolute directory")

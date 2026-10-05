@@ -14,6 +14,7 @@ import "ai"
 import "compact"
 import "keychain"
 import "fff"
+import "instructions"
 import devlog "devlog:."
 import "rpc"
 import "session"
@@ -121,7 +122,7 @@ main :: proc() {
 	}
 	cwd, _ := os.get_working_directory(context.allocator)
 	ctx := agent.Context {
-		system_prompt = system_prompt(context.allocator),
+		system_prompt = instructions.render(system_prompt(context.allocator), instructions.load(cwd, os.get_env("HOME", context.allocator))),
 		tools = make_tools(context.allocator, cwd),
 	}
 	cancel := ai.Cancellation{}

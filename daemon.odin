@@ -47,6 +47,7 @@ serve_daemon :: proc(base: agent.Loop_Config) -> int {
 		default_model = base.model.id,
 		system_prompt = system_prompt(context.allocator),
 		default_cwd   = default_cwd(),
+		home          = os.get_env("HOME", context.allocator),
 		base          = base,
 		make_tools    = make_tools,
 	}
