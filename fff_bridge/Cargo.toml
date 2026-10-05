@@ -1,0 +1,28 @@
+# hw_agent's search layer: fff-mcp's tool implementations (compiled from the
+# pinned fff checkout in build/fff/src, see scripts/build_fff.sh) behind a C API.
+[package]
+name = "hw_fff_bridge"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["staticlib"]
+path = "src/lib.rs"
+
+[dependencies]
+fff = { package = "fff-search", path = "../build/fff/src/crates/fff-core", default-features = false, features = ["definitions", "mimalloc-collect", "ripgrep"] }
+fff-query-parser = { path = "../build/fff/src/crates/fff-query-parser", default-features = false, features = ["ripgrep"] }
+git2 = { version = "0.21.0", default-features = false, features = ["vendored-libgit2"] }
+mimalloc = "0.1.47"
+rmcp = { version = "1.7.0", features = ["server"] }
+schemars = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"

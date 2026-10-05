@@ -7,6 +7,7 @@ BUILD="$ROOT/build"
 MODE=${1:-debug}
 mkdir -p "$BUILD"
 python3 "$ROOT/scripts/check_dependencies.py" "$MODE"
+"$ROOT/scripts/build_fff.sh"
 
 case "$MODE" in
   debug)

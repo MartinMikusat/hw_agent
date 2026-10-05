@@ -13,6 +13,7 @@ import "agent"
 import "ai"
 import "compact"
 import "keychain"
+import "fff"
 import devlog "devlog:."
 import "rpc"
 import "session"
@@ -22,8 +23,8 @@ DEFAULT_MODEL :: "deepseek/deepseek-v4.1-flash"
 DEFAULT_CONTEXT_WINDOW :: 1_000_000
 
 SYSTEM_PROMPT :: `You are a coding agent running inside hw_agent, a minimal harness.
-Use the bash tool to inspect the environment and complete the user's task.
-Be concise.`
+Use find_files, grep and multi_grep to locate code, read/edit/write for files,
+and bash for everything else. Be concise.`
 
 USAGE :: `usage: hw_agent "<prompt>" [-model=<id>] [-session=<path>]
        hw_agent -rpc [-model=<id>] [-session=<path>]
@@ -118,9 +119,10 @@ main :: proc() {
 		cfg.model.provider_options.trace_dir = cli_trace_dir()
 		start_trace_pruning(traces_dir(), false)
 	}
+	cwd, _ := os.get_working_directory(context.allocator)
 	ctx := agent.Context {
-		system_prompt = SYSTEM_PROMPT,
-		tools = make_tools(context.allocator),
+		system_prompt = system_prompt(context.allocator),
+		tools = make_tools(context.allocator, cwd),
 	}
 	cancel := ai.Cancellation{}
 
@@ -183,16 +185,18 @@ base_config :: proc(model_id, api_key: string) -> agent.Loop_Config {
 	}
 }
 
-// Tools resolve paths against the process working directory.
-make_tools :: proc(allocator: mem.Allocator) -> []agent.Tool_Definition {
-	cwd, _ := os.get_working_directory(allocator)
+// Tools resolve paths against cwd; search runs on the fff index covering it.
+make_tools :: proc(allocator: mem.Allocator, cwd: string) -> []agent.Tool_Definition {
 	file_state := tools.file_tool_state(cwd, allocator)
-	list := make([]agent.Tool_Definition, 4, allocator)
-	list[0] = tools.bash_tool(cwd, allocator)
-	list[1] = tools.read_tool(file_state)
-	list[2] = tools.write_tool(file_state)
-	list[3] = tools.edit_tool(file_state)
-	return list
+	list := make([dynamic]agent.Tool_Definition, 0, 8, allocator)
+	append(&list, tools.bash_tool(cwd, allocator), tools.read_tool(file_state), tools.write_tool(file_state), tools.edit_tool(file_state))
+	append(&list, ..tools.search_tools(cwd, allocator))
+	return list[:]
+}
+
+// system_prompt adds fff's search guidance, as fff-mcp gives Claude Code.
+system_prompt :: proc(allocator: mem.Allocator) -> string {
+	return strings.concatenate({SYSTEM_PROMPT, "\n\n# File search\n\n", fff.instructions()}, allocator)
 }
 
 // exit closes the dev log first, so a deliberate exit is never read as a crash.

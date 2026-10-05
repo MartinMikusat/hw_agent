@@ -29,7 +29,7 @@ test_append_reopen_replays :: proc(t: ^testing.T) {
 		s, msgs, err := open(path, context.temp_allocator)
 		testing.expect(t, err == nil, "open should succeed")
 		testing.expect_value(t, len(msgs), 0)
-		testing.expect(t, append_header(s, "test/model") == nil)
+		testing.expect(t, append_header(s, "test/model", "/tmp/project") == nil)
 		_ = append_message(s, agent.Agent_Message{role = .User, text = "hello"})
 		_ = append_message(s, agent.Agent_Message {
 			role       = .Assistant,
@@ -46,6 +46,7 @@ test_append_reopen_replays :: proc(t: ^testing.T) {
 
 	testing.expect_value(t, len(msgs), 3)
 	testing.expect_value(t, s.model, "test/model")
+	testing.expect_value(t, s.cwd, "/tmp/project")
 	testing.expect_value(t, msgs[0].role, agent.Agent_Role.User)
 	testing.expect_value(t, msgs[0].text, "hello")
 	testing.expect_value(t, msgs[1].role, agent.Agent_Role.Assistant)

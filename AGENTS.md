@@ -3,11 +3,15 @@
 Minimal agentic harness in Odin. Provider-neutral loop, JSONL sessions,
 pi-style compaction, JSONL stdio RPC front-end, and a shared socket daemon
 (`serve/`) that every native app can drive. Intended backend for hw_launcher.
+File search is fff (`fff/` bindings, `fff_bridge/` Rust crate): fff-mcp's own
+find_files / grep / multi_grep, statically linked, one index per project root,
+frecency shared with fff.nvim.
 
 ## Commands
 
 - `./test.sh` — build and run every package test
-- `./build.sh [debug|release]` — build `build/hw_agent` (debug) or
+- `./build.sh [debug|release]` — builds fff_bridge first (`scripts/build_fff.sh`:
+  pinned fff checkout in `build/fff/src`, needs cargo), then `build/hw_agent` (debug) or
   `build/hw_agent-release` (embeds the Info.plist the updater pins)
 - `hw-odin test <pkg>/` — one package test (`ai`, `agent`, `session`, `compact`, `rpc`, `serve`)
 - `./build/hw_agent "<prompt>" [-model=<id>] [-session=<path>]` — print mode
@@ -22,6 +26,10 @@ pi-style compaction, JSONL stdio RPC front-end, and a shared socket daemon
   when `OPENROUTER_API_KEY` is unset
 - `./build/hw_agent -install [-model=<id>]` / `-uninstall` — LaunchAgent
   `com.halwayland.hw_agent` running `-serve`; requires a stored key
+
+Daemon sessions each have a working directory (`create` takes `cwd`, default
+the daemon's); tools and the fff index use it. Bump `FFF_REVISION` in
+`scripts/build_fff.sh` to follow a new fff-mcp release.
 
 ## Release and install
 

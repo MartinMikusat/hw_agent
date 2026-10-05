@@ -4,7 +4,8 @@
 // to the connections attached to it.
 //
 //   in:  {"cmd":"list"}                          → {"type":"sessions","sessions":[...]}
-//        {"cmd":"create","model"?:"..."}         → {"type":"created","session":id} (attaches)
+//        {"cmd":"create","model"?:"...","cwd"?:"/abs/dir"}
+//                                                → {"type":"created","session":id,"model","cwd"} (attaches)
 //        {"cmd":"attach","session":id}           → {"type":"snapshot","session":id,"running":bool,"messages":[...]}
 //                                                  then live events
 //        {"cmd":"detach","session":id}
@@ -53,9 +54,10 @@ Config :: struct {
 	sessions_dir:  string,
 	traces_dir:    string, // per-session raw provider traces; "" when tracing is off
 	default_model: string,
+	default_cwd:   string, // for sessions created without one and logs that predate cwd
 	system_prompt: string,
 	base:          agent.Loop_Config, // per-session copy; model.id is replaced
-	make_tools:    proc(allocator: mem.Allocator) -> []agent.Tool_Definition,
+	make_tools:    proc(allocator: mem.Allocator, cwd: string) -> []agent.Tool_Definition,
 }
 
 Daemon :: struct {
@@ -86,6 +88,7 @@ MAX_OUTBOUND_BYTES :: 16 * 1024 * 1024
 Live_Session :: struct {
 	id:      string,
 	path:    string,
+	cwd:     string,
 	ctx:     agent.Context,
 	cfg:     agent.Loop_Config,
 	cancel:  ai.Cancellation,
@@ -324,14 +327,20 @@ handle :: proc(d: ^Daemon, c: ^Conn, v: json.Value) {
 	case "create":
 		model, _ := obj["model"].(json.String)
 		if len(model) == 0 { model = json.String(d.cfg.default_model) }
-		ls, err := create_session(d, string(model))
+		cwd, _ := obj["cwd"].(json.String)
+		if len(cwd) == 0 { cwd = json.String(d.cfg.default_cwd) }
+		if !strings.has_prefix(string(cwd), "/") || !os.is_dir(string(cwd)) {
+			reply_error(c, req, "", "cwd must be an existing absolute directory")
+			return
+		}
+		ls, err := create_session(d, string(model), string(cwd))
 		if err != "" {
 			reply_error(c, req, "", err)
 			return
 		}
 		sync.recursive_mutex_lock(&ls.mu)
 		append(&ls.subs, c)
-		reply(c, req, "created", map[string]json.Value{"session" = ls.id, "model" = ls.cfg.model.id})
+		reply(c, req, "created", map[string]json.Value{"session" = ls.id, "model" = ls.cfg.model.id, "cwd" = ls.cwd})
 		sync.recursive_mutex_unlock(&ls.mu)
 	case "attach":
 		ls, err := live(d, string(id))
@@ -376,7 +385,7 @@ live :: proc(d: ^Daemon, id: string) -> (^Live_Session, string) {
 	if ls, ok := d.sessions[id]; ok { return ls, "" }
 	path := session_path(d, id, context.temp_allocator)
 	if !os.exists(path) { return nil, "no such session" }
-	return start_session(d, id, path, "")
+	return start_session(d, id, path, "", "")
 }
 
 // delete_session removes a session's log and traces. A live session is stopped
@@ -419,24 +428,24 @@ delete_session :: proc(d: ^Daemon, id: string, caller: ^Conn) -> string {
 }
 
 @(private)
-create_session :: proc(d: ^Daemon, model: string) -> (^Live_Session, string) {
+create_session :: proc(d: ^Daemon, model, cwd: string) -> (^Live_Session, string) {
 	raw: [ID_BYTES]u8
 	crypto.rand_bytes(raw[:])
 	id := string(hex.encode(raw[:], context.temp_allocator))
 	sync.mutex_lock(&d.mu)
 	defer sync.mutex_unlock(&d.mu)
-	return start_session(d, id, session_path(d, id, context.temp_allocator), model)
+	return start_session(d, id, session_path(d, id, context.temp_allocator), model, cwd)
 }
 
 // start_session opens the log and launches the session's loop thread. A
 // non-empty new_model creates the log with that model. Caller holds d.mu.
 @(private)
-start_session :: proc(d: ^Daemon, id, path, new_model: string) -> (^Live_Session, string) {
+start_session :: proc(d: ^Daemon, id, path, new_model, new_cwd: string) -> (^Live_Session, string) {
 	a := d.allocator
 	sess, messages, err := session.open(path, a)
 	if err != nil { return nil, fmt.tprintf("session open failed: %v", err) } // recorded by session.open
 	if len(new_model) > 0 {
-		if herr := session.append_header(sess, new_model); herr != nil {
+		if herr := session.append_header(sess, new_model, new_cwd); herr != nil {
 			devlog.failed(devlog.global(), {feature = "session", operation = "create"}, {reason = "session header could not be written"})
 			session.close(sess)
 			return nil, fmt.tprintf("session create failed: %v", herr)
@@ -449,7 +458,8 @@ start_session :: proc(d: ^Daemon, id, path, new_model: string) -> (^Live_Session
 	ls.sess = sess
 	ls.subs = make([dynamic]^Conn, 0, 4, a)
 	ls.ctx.system_prompt = d.cfg.system_prompt
-	ls.ctx.tools = d.cfg.make_tools(a)
+	ls.cwd = len(sess.cwd) > 0 ? sess.cwd : strings.clone(d.cfg.default_cwd, a)
+	ls.ctx.tools = d.cfg.make_tools(a, ls.cwd)
 	ls.ctx.messages = make([dynamic]agent.Agent_Message, 0, len(messages) + 16, a)
 	append(&ls.ctx.messages, ..messages)
 	ls.cfg = d.cfg.base
@@ -508,6 +518,7 @@ attach :: proc(ls: ^Live_Session, c: ^Conn, req: json.Value) {
 		type:     string,
 		session:  string,
 		model:    string,
+		cwd:      string,
 		running:  bool,
 		messages: []agent.Agent_Message,
 		req:      json.Value `json:"req,omitempty"`,
@@ -516,6 +527,7 @@ attach :: proc(ls: ^Live_Session, c: ^Conn, req: json.Value) {
 		type = "snapshot",
 		session = ls.id,
 		model = ls.cfg.model.id,
+		cwd = ls.cwd,
 		running = sync.atomic_load(&ls.srv.running),
 		messages = messages,
 		req = req,
@@ -549,6 +561,7 @@ reply_list :: proc(d: ^Daemon, c: ^Conn, req: json.Value) {
 	Entry :: struct {
 		id:      string,
 		model:   string,
+		cwd:     string,
 		running: bool,
 		updated: i64, // unix seconds of the last log write
 	}
@@ -561,9 +574,10 @@ reply_list :: proc(d: ^Daemon, c: ^Conn, req: json.Value) {
 		e := Entry{id = id, updated = f.modification_time._nsec / 1e9}
 		if ls, ok := d.sessions[id]; ok {
 			e.model = ls.cfg.model.id
+			e.cwd = ls.cwd
 			e.running = sync.atomic_load(&ls.srv.running)
 		} else {
-			e.model = header_model(f.fullpath)
+			e.model, e.cwd = header_of(f.fullpath)
 		}
 		append(&entries, e)
 	}
@@ -577,19 +591,19 @@ reply_list :: proc(d: ^Daemon, c: ^Conn, req: json.Value) {
 	write_encoded(c, data)
 }
 
-// Model from a log's first line; "" for logs without a header.
+// Model and cwd from a log's first line; "" for logs without a header.
 @(private)
-header_model :: proc(path: string) -> string {
+header_of :: proc(path: string) -> (model, cwd: string) {
 	f, err := os.open(path)
-	if err != nil { return "" }
+	if err != nil { return }
 	defer os.close(f)
 	buf: [4096]u8
 	n, _ := os.read(f, buf[:])
 	line := string(buf[:n])
 	if nl := strings.index_byte(line, '\n'); nl >= 0 { line = line[:nl] }
 	entry: session.Entry
-	if json.unmarshal_string(line, &entry, allocator = context.temp_allocator) != nil { return "" }
-	return entry.kind == .Header ? entry.model : ""
+	if json.unmarshal_string(line, &entry, allocator = context.temp_allocator) != nil || entry.kind != .Header { return }
+	return entry.model, entry.cwd
 }
 
 @(private)

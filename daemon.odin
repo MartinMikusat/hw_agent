@@ -20,14 +20,33 @@ support_dir :: proc() -> string {
 	return fmt.aprintf("%s/Library/Application Support/hw_agent", home)
 }
 
+// launchd starts the daemon with only the system PATH, which hides Homebrew
+// and user tools from the model's bash calls. Prepend the usual locations that
+// exist, keeping whatever PATH already has.
+complete_path :: proc() {
+	home := os.get_env("HOME", context.temp_allocator)
+	current := os.get_env("PATH", context.temp_allocator)
+	parts := make([dynamic]string, context.temp_allocator)
+	for dir in ([]string{"/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", fmt.tprintf("%s/.local/bin", home), fmt.tprintf("%s/.cargo/bin", home)}) {
+		if os.is_dir(dir) && !strings.contains(fmt.tprintf(":%s:", current), fmt.tprintf(":%s:", dir)) {
+			append(&parts, dir)
+		}
+	}
+	if len(parts) == 0 { return }
+	append(&parts, current)
+	_ = os.set_env("PATH", strings.join(parts[:], ":", context.temp_allocator))
+}
+
 serve_daemon :: proc(base: agent.Loop_Config) -> int {
+	complete_path()
 	dir := support_dir()
 	cfg := serve.Config {
 		socket_path   = fmt.aprintf("%s/agent.sock", dir),
 		sessions_dir  = fmt.aprintf("%s/sessions", dir),
 		traces_dir    = tracing_enabled() ? traces_dir() : "",
 		default_model = base.model.id,
-		system_prompt = SYSTEM_PROMPT,
+		system_prompt = system_prompt(context.allocator),
+		default_cwd   = default_cwd(),
 		base          = base,
 		make_tools    = make_tools,
 	}
@@ -47,6 +66,11 @@ serve_daemon :: proc(base: agent.Loop_Config) -> int {
 	if len(cfg.traces_dir) > 0 { start_trace_pruning(cfg.traces_dir, true) }
 	serve.run(d)
 	return 0
+}
+
+default_cwd :: proc() -> string {
+	cwd, _ := os.get_working_directory(context.allocator)
+	return cwd
 }
 
 plist_path :: proc() -> string {

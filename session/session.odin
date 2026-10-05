@@ -42,6 +42,7 @@ Entry :: struct {
 	// kind == .Header
 	model:   string `json:"model,omitempty"`,
 	created: i64 `json:"created,omitempty"`,
+	cwd:     string `json:"cwd,omitempty"`,
 }
 
 Session :: struct {
@@ -50,6 +51,7 @@ Session :: struct {
 	next_seq:  int,
 	tip_id:    string,
 	model:     string, // from the header entry; "" when absent
+	cwd:       string, // working directory from the header; "" when absent
 	allocator: mem.Allocator,
 }
 
@@ -122,6 +124,7 @@ replay_into :: proc(s: ^Session, path: string, messages: ^[dynamic]agent.Agent_M
 			}
 		case .Header:
 			s.model = entry.model
+			s.cwd = entry.cwd
 		}
 		s.tip_id = entry.id
 		s.next_seq = entry.seq + 1
@@ -166,8 +169,8 @@ append_compaction :: proc(s: ^Session, data: ^agent.Compaction) -> os.Error {
 	return write_entry(s, entry)
 }
 
-// First entry of a new session: the model it runs on.
-append_header :: proc(s: ^Session, model: string) -> os.Error {
+// First entry of a new session: the model it runs on and its working directory.
+append_header :: proc(s: ^Session, model, cwd: string) -> os.Error {
 	assert(s.file != nil)
 	assert(s.next_seq == 0)
 	entry := Entry {
@@ -176,9 +179,11 @@ append_header :: proc(s: ^Session, model: string) -> os.Error {
 		kind    = .Header,
 		model   = model,
 		created = time.to_unix_seconds(time.now()),
+		cwd     = cwd,
 	}
 	if err := write_entry(s, entry); err != nil { return err }
 	s.model = strings.clone(model, s.allocator)
+	s.cwd = strings.clone(cwd, s.allocator)
 	return nil
 }
 

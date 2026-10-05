@@ -56,7 +56,7 @@ stub_stream :: proc(model: ai.Model, ctx: ai.Context, api_key: string, cancel: ^
 	return ai.Stream{data = st, next = stub_next, result = stub_result, close = stub_close}, nil
 }
 
-no_tools :: proc(allocator: mem.Allocator) -> []agent.Tool_Definition { return nil }
+no_tools :: proc(allocator: mem.Allocator, cwd: string) -> []agent.Tool_Definition { return nil }
 
 Client :: struct {
 	fd:  posix.FD,
@@ -116,6 +116,7 @@ test_two_clients_share_session :: proc(t: ^testing.T) {
 		sessions_dir  = fmt.aprintf("%s/sessions", root, allocator = context.temp_allocator),
 		default_model = "stub/model",
 		make_tools    = no_tools,
+		default_cwd   = tmp,
 		base          = {stream = stub_stream, model = {data = gate, context_window = 100_000}},
 	}
 	d, lerr := listen(cfg, runtime.heap_allocator())
@@ -137,6 +138,10 @@ test_two_clients_share_session :: proc(t: ^testing.T) {
 	testing.expect_value(t, created["req"].(json.Float), 7)
 	id := string(created["session"].(json.String))
 	testing.expect_value(t, string(created["model"].(json.String)), "stub/model")
+	testing.expect_value(t, string(created["cwd"].(json.String)), tmp)
+
+	send_line(&a, `{"cmd":"create","cwd":"relative/dir"}`)
+	testing.expect_value(t, string(expect_type(&a, "error")["text"].(json.String)), "cwd must be an existing absolute directory")
 
 	send_line(&a, fmt.tprintf(`{{"cmd":"prompt","session":"%s","text":"hello"}}`, id))
 	testing.expect(t, expect_type(&a, "agent_start") != nil)
