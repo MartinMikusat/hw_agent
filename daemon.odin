@@ -111,6 +111,14 @@ login :: proc() -> int {
 		fmt.eprintln("no key entered")
 		return 1
 	}
+	// Pastes can carry invisible characters (non-breaking spaces, terminal escapes)
+	// that OpenRouter then rejects as an unknown user.
+	for ch, i in transmute([]u8)key {
+		if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '-' || ch == '_') {
+			fmt.eprintfln("the key has an unexpected byte 0x%2x at position %d of %d; paste it again", ch, i + 1, len(key))
+			return 1
+		}
+	}
 	if status := keychain.write(KEYCHAIN_ACCOUNT, key); status != 0 {
 		fmt.eprintfln("Keychain write failed: OSStatus %d", status)
 		return 1
