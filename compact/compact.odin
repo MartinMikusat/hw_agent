@@ -10,6 +10,7 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
 import "core:strings"
+import devlog "devlog:."
 import "core:time"
 
 import "../agent"
@@ -224,10 +225,14 @@ maybe_compact :: proc(
 	if !needs(ctx, cfg.model) {
 		return nil
 	}
+	site := devlog.Site{feature = "compaction", operation = "summarize"}
 	cut := find_cut(ctx.messages[:], KEEP_CHARS)
 	if cut < 0 {
+		devlog.failed(devlog.global(), site, {reason = "context over threshold but no safe cut", severity = .Warning})
 		return nil
 	}
+	started := time.tick_now()
+	devlog.started(devlog.global(), site)
 
 	head_text := serialize_head(ctx.messages[:cut], allocator)
 	prompt := fmt.aprintf(SUMMARY_TEMPLATE, head_text, allocator = allocator)
@@ -238,6 +243,7 @@ maybe_compact :: proc(
 	}
 	stream, serr := cfg.stream(cfg.model, sum_ctx, cfg.api_key, nil, allocator)
 	if serr != nil {
+		devlog.failed(devlog.global(), site, {reason = "summary request failed; context kept", severity = .Warning, code = i32(serr)})
 		return nil
 	}
 	defer stream.close(&stream)
@@ -252,12 +258,15 @@ maybe_compact :: proc(
 		}
 	}
 	if failed {
+		devlog.failed(devlog.global(), site, {reason = "summary request failed; context kept", severity = .Warning})
 		return nil
 	}
 	final := stream.result(&stream)
 	if len(final.text) == 0 {
+		devlog.failed(devlog.global(), site, {reason = "summary was empty; context kept", severity = .Warning})
 		return nil
 	}
+	devlog.succeeded(devlog.global(), site, metrics = {duration_ms = i64(time.duration_milliseconds(time.tick_since(started)))})
 
 	read, modified := file_ops(ctx.messages[:cut], allocator)
 	summary := strings.builder_make(allocator)

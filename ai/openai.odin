@@ -15,6 +15,7 @@ import "core:strings"
 import "core:sync"
 import "core:thread"
 import "core:time"
+import devlog "devlog:."
 import "core:unicode/utf8"
 
 CURL_URL :: "https://openrouter.ai/api/v1/chat/completions"
@@ -52,7 +53,15 @@ OpenAI_Stream :: struct {
 	timeout: time.Duration,
 	waited: bool,
 	read_error: io.Error,
+	// Dev log: cause is the stable reason of a failed stream (a source literal),
+	// http_* the provider's error body, which --fail-with-body puts on stdout.
+	cause: string,
+	http_code: i32,
+	http_message: string,
 }
+
+// MAX_ERROR_DETAIL bounds the provider message kept for replies and the dev log.
+MAX_ERROR_DETAIL :: 300
 
 is_cancelled :: proc(cancel: ^Cancellation) -> bool {
 	if cancel == nil {
@@ -249,9 +258,12 @@ stream_openai :: proc(
 	cancel: ^Cancellation,
 	allocator: mem.Allocator,
 ) -> (
-	Stream,
-	Error,
+	stream: Stream,
+	err: Error,
 ) {
+	defer if err != nil && err != .Aborted {
+		devlog.failed(devlog.global(), {feature = "provider", operation = "start"}, {reason = "provider request could not start", code = i32(err)})
+	}
 	assert(len(api_key) > 0, "stream_openai requires an API key")
 	assert(len(model.id) > 0, "stream_openai requires a model id")
 	if is_cancelled(cancel) {
@@ -368,6 +380,7 @@ stream_openai :: proc(
 		}
 	}
 	retained = true
+	devlog.started(devlog.global(), {feature = "provider", operation = "stream"})
 
 	return Stream {
 		data = impl,
@@ -449,7 +462,27 @@ next_line :: proc(impl: ^OpenAI_Stream) -> (line: string, ok: bool) {
 	return strings.trim_right(string(raw), "\r\n"), true
 }
 
+// openai_stream_next records each request's outcome in the dev log once, at the
+// stream's terminal event.
 openai_stream_next :: proc(s: ^Stream) -> (Event, bool) {
+	impl := cast(^OpenAI_Stream)s.data
+	was_emitted := impl.emitted
+	event, ok := stream_next(s)
+	if !ok || was_emitted || !impl.emitted { return event, ok }
+	site := devlog.Site{feature = "provider", operation = "stream"}
+	metrics := devlog.Metrics{duration_ms = i64(time.duration_milliseconds(time.tick_since(impl.started_at)))}
+	switch {
+	case event.kind == .Done:
+		devlog.succeeded(devlog.global(), site, metrics = metrics)
+	case event.reason == .Aborted:
+		devlog.stopped(devlog.global(), site, metrics = metrics)
+	case:
+		devlog.failed(devlog.global(), site, {reason = impl.cause, detail = impl.http_message, code = impl.http_code})
+	}
+	return event, ok
+}
+
+stream_next :: proc(s: ^Stream) -> (Event, bool) {
 	impl := cast(^OpenAI_Stream)s.data
 	if impl.emitted {
 		return {}, false
@@ -482,11 +515,14 @@ openai_stream_next :: proc(s: ^Stream) -> (Event, bool) {
 				return stream_error(impl, "cannot wait for provider process"), true
 			}
 			if state.exit_code != 0 {
-				msg := fmt.aprintf(
-					"curl exited %d",
-					state.exit_code,
-					allocator = impl.allocator,
-				)
+				if impl.http_code != 0 {
+					impl.cause = "provider rejected the request"
+					msg := fmt.aprintf("provider error %d: %s", impl.http_code, impl.http_message, allocator = impl.allocator)
+					return stream_error(impl, msg), true
+				}
+				impl.cause = "provider process failed"
+				impl.http_code = i32(state.exit_code)
+				msg := fmt.aprintf("curl exited %d", state.exit_code, allocator = impl.allocator)
 				return stream_error(impl, msg), true
 			}
 			return stream_error(impl, "provider stream ended without [DONE]"), true
@@ -549,12 +585,33 @@ queue_delta :: proc(impl: ^OpenAI_Stream, kind: Event_Kind, text: string) {
 	impl.pending_count += 1
 }
 
+// stream_error ends the stream. Call sites pass literal text, which doubles as
+// the dev-log cause unless the site set impl.cause to a literal first.
 stream_error :: proc(impl: ^OpenAI_Stream, text: string, reason: Stop_Reason = .Error) -> Event {
+	if len(impl.cause) == 0 { impl.cause = text }
 	finalize_partial(impl)
 	impl.final.stop_reason = reason
 	impl.final.usage = impl.usage
 	impl.final.usage.complete = false
 	return Event {kind = .Error, text = text, reason = reason, partial = &impl.final}
+}
+
+// capture_http_error keeps the {"error":{"message","code"}} body of a rejected
+// request, which arrives outside the SSE framing.
+capture_http_error :: proc(impl: ^OpenAI_Stream, line: string) {
+	value, perr := json.parse_string(line, .JSON, false, impl.allocator)
+	if perr != nil { return }
+	defer json.destroy_value(value, impl.allocator)
+	obj, _ := value.(json.Object)
+	err_obj, is_err := obj["error"].(json.Object)
+	if !is_err { return }
+	msg, _ := err_obj["message"].(json.String)
+	impl.http_message = strings.clone(string(msg)[:min(len(msg), MAX_ERROR_DETAIL)], impl.allocator)
+	#partial switch code in err_obj["code"] {
+	case json.Integer: impl.http_code = i32(code)
+	case json.Float:   impl.http_code = i32(code)
+	}
+	if impl.http_code == 0 { impl.http_code = -1 }
 }
 
 handle_sse_line :: proc(impl: ^OpenAI_Stream, line: string) -> (Event, bool) {
@@ -570,6 +627,7 @@ handle_sse_line :: proc(impl: ^OpenAI_Stream, line: string) -> (Event, bool) {
 		return {}, false
 	}
 	if !strings.has_prefix(line, "data:") {
+		if strings.has_prefix(line, "{") { capture_http_error(impl, line) }
 		return {}, false
 	}
 	data := strings.trim_space(line[5:])
@@ -640,6 +698,8 @@ handle_sse_line :: proc(impl: ^OpenAI_Stream, line: string) -> (Event, bool) {
 			if s, sok := err_obj["message"].(json.String); sok {
 				msg = string(s)
 			}
+			impl.cause = "provider reported a stream error"
+			impl.http_message = strings.clone(msg[:min(len(msg), MAX_ERROR_DETAIL)], impl.allocator)
 			return stream_error(impl, strings.clone(msg, impl.allocator)), true
 		}
 	}

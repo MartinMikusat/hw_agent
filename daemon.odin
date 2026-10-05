@@ -9,6 +9,7 @@ import "core:sys/posix"
 
 import "agent"
 import "keychain"
+import devlog "devlog:."
 import "serve"
 
 LAUNCH_LABEL :: "com.halwayland.hw_agent"
@@ -31,10 +32,16 @@ serve_daemon :: proc(base: agent.Loop_Config) -> int {
 	}
 	d, err := serve.listen(cfg, context.allocator)
 	if err != .None {
+		devlog.failed(devlog.global(), {feature = "daemon", operation = "listen"}, {
+			reason = err == .Already_Running ? "another daemon owns the socket" : "socket could not be bound",
+			code = i32(err),
+			severity = err == .Already_Running ? .Warning : .Error,
+		})
 		fmt.eprintfln("hw_agent -serve: %v (%s)", err, cfg.socket_path)
 		return 1
 	}
 	fmt.eprintfln("hw_agent %s -serve: listening on %s", APP_VERSION, cfg.socket_path)
+	devlog.started(devlog.global(), {feature = "daemon", operation = "serve"})
 	update_start(d)
 	serve.run(d)
 	return 0

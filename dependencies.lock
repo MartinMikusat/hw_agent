@@ -2,6 +2,12 @@
   "schema": 1,
   "repositories": [
     {
+      "name": "hw_odin_devlog",
+      "path": "../odin_libraries/hw_odin_devlog",
+      "url": "https://github.com/MartinMikusat/hw_odin_devlog.git",
+      "revision": "58da74b1830712bfad7057d6c1401bbe423e3a63"
+    },
+    {
       "name": "hw_odin_native_update",
       "path": "../odin_libraries/hw_odin_native_update",
       "url": "https://github.com/MartinMikusat/hw_odin_native_update.git",

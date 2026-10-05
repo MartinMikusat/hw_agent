@@ -4,6 +4,8 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:os"
 import "core:strings"
+import "core:time"
+import devlog "devlog:."
 
 import "../agent"
 import "../ai"
@@ -54,11 +56,14 @@ bash_execute :: proc(
 
 	// ponytail: no timeout enforcement yet — the loop's cancel flag is the only
 	// interrupt. Add a deadline watcher when parallel tool threads land.
+	started := time.tick_now()
+	defer devlog.sample_since(devlog.global(), {feature = "tools", operation = "bash"}, started)
 	proc_state, stdout, stderr, err := os.process_exec(os.Process_Desc {
 		command = {"bash", "-c", string(command)},
 		working_dir = state.working_dir,
 	}, context.allocator)
 	if err != nil {
+		devlog.failed(devlog.global(), {feature = "tools", operation = "bash"}, {reason = "bash could not be started"})
 		return {text = fmt.tprintf("failed to spawn bash: %v", err), is_error = true}
 	}
 	out := strings.builder_make()

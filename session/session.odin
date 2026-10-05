@@ -12,6 +12,7 @@ import "core:mem"
 import "core:os"
 import "core:strings"
 import "core:time"
+import devlog "devlog:."
 
 import "../agent"
 
@@ -63,12 +64,17 @@ open :: proc(path: string, allocator: mem.Allocator) -> (^Session, []agent.Agent
 	messages := make([dynamic]agent.Agent_Message, 0, 64, allocator)
 	if os.exists(path) {
 		if err := replay_into(s, path, &messages); err != nil {
+			devlog.failed(devlog.global(), {feature = "session", operation = "open"}, {
+				reason = err == os.General_Error.Invalid_File ? "session log is corrupt" : "session log could not be read",
+				detail = basename(path),
+			})
 			return nil, nil, err
 		}
 	}
 
 	file, oerr := os.open(path, {.Write, .Create, .Append}, os.perm(0o600))
 	if oerr != nil {
+		devlog.failed(devlog.global(), {feature = "session", operation = "open"}, {reason = "session log could not be opened for append", detail = basename(path)})
 		return nil, nil, oerr
 	}
 	s.file = file
@@ -201,13 +207,14 @@ Emit_Session :: struct {
 
 emit :: proc(event: agent.Event, userdata: rawptr) {
 	w := cast(^Emit_Session)userdata
+	err: os.Error
 	#partial switch e in event {
 	case agent.Event_Message_End:
-		_ = append_message(w.session, e.message^)
+		err = append_message(w.session, e.message^)
 	case agent.Event_Compaction:
-		_ = append_compaction(w.session, e.data)
+		err = append_compaction(w.session, e.data)
 	case agent.Event_Tool_End:
-		_ = append_message(w.session, agent.Agent_Message {
+		err = append_message(w.session, agent.Agent_Message {
 			role        = .Tool_Result,
 			tool_call_id = e.id,
 			text        = e.text,
@@ -215,7 +222,17 @@ emit :: proc(event: agent.Event, userdata: rawptr) {
 			timestamp   = time.to_unix_seconds(time.now()),
 		})
 	}
+	if err != nil {
+		// The run continues in memory; this transcript entry is lost on disk.
+		devlog.failed(devlog.global(), {feature = "session", operation = "append"}, {reason = "session entry could not be written", detail = basename(w.session.path)})
+	}
 	if w.inner != nil {
 		w.inner(event, w.inner_userdata)
 	}
+}
+
+@(private)
+basename :: proc(path: string) -> string {
+	i := strings.last_index_byte(path, '/')
+	return path[i + 1:]
 }

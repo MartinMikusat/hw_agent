@@ -2,7 +2,10 @@
 
 set -eu
 
-"$(dirname -- "$0")/build.sh"
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+ODIN_LIBS=$(CDPATH= cd -- "${ODIN_LIBS:-$ROOT/../odin_libraries}" && pwd)
+python3 "$ODIN_LIBS/hw_odin_devlog/scripts/lint_devlog.py" "$ROOT"
+"$ROOT/build.sh"
 for package in ai agent session compact rpc serve; do
-    hw-odin test "$package/"
+    hw-odin test "$ROOT/$package/" -collection:devlog="$ODIN_LIBS/hw_odin_devlog"
 done

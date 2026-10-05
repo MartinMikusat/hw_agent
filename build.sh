@@ -44,7 +44,7 @@ PLIST
     ;;
 esac
 
-set -- -collection:native_update="$ODIN_LIBS/hw_odin_native_update" -out:"$OUT"
+set -- -collection:native_update="$ODIN_LIBS/hw_odin_native_update" -collection:devlog="$ODIN_LIBS/hw_odin_devlog" -out:"$OUT"
 if [ -n "$PLIST" ]; then
   set -- "$@" -extra-linker-flags:"-sectcreate __TEXT __info_plist $PLIST"
 fi

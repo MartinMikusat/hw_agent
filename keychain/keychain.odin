@@ -5,6 +5,7 @@ package keychain
 
 import CF "core:sys/darwin/CoreFoundation"
 import "core:strings"
+import devlog "devlog:."
 
 foreign import security "system:Security.framework"
 foreign import corefoundation "system:CoreFoundation.framework"
@@ -69,6 +70,9 @@ read :: proc(account: string, allocator := context.allocator) -> (string, i32) {
 	defer CF.CFRelease(query)
 	result: CF.TypeRef
 	status := SecItemCopyMatching(query, &result)
+	if status != 0 && status != ERR_ITEM_NOT_FOUND {
+		devlog.failed(devlog.global(), {feature = "keychain", operation = "read"}, {reason = "keychain item could not be read", code = status})
+	}
 	if status != 0 || result == nil { return "", status }
 	defer CF.CFRelease(result)
 	n := int(CFDataGetLength(result))
@@ -88,11 +92,20 @@ write :: proc(account, secret: string) -> i32 {
 	update := dict({kSecValueData}, {data})
 	defer CF.CFRelease(update)
 	status := SecItemUpdate(query, update)
-	if status != ERR_ITEM_NOT_FOUND { return status }
+	if status != ERR_ITEM_NOT_FOUND {
+		if status != 0 {
+			devlog.failed(devlog.global(), {feature = "keychain", operation = "write"}, {reason = "keychain item could not be written", code = status})
+		}
+		return status
+	}
 	attrs := dict(
 		{kSecClass, kSecAttrService, kSecAttrAccount, kSecValueData},
 		{kSecClassGenericPassword, service, acct, data},
 	)
 	defer CF.CFRelease(attrs)
-	return SecItemAdd(attrs, nil)
+	status = SecItemAdd(attrs, nil)
+	if status != 0 {
+		devlog.failed(devlog.global(), {feature = "keychain", operation = "write"}, {reason = "keychain item could not be written", code = status})
+	}
+	return status
 }

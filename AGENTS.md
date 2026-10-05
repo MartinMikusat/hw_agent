@@ -38,6 +38,12 @@ verification runs use it. Auth: Keychain via `-login`, or `OPENROUTER_API_KEY`.
 
 `HW_DEBUG=1` dumps raw SSE lines to stderr.
 
+Dev log (`hw_odin_devlog`): journals in
+`~/Library/Application Support/hw_agent/devlog/{daemon,cli}` (`HW_DEVLOG_DIR`
+overrides; use `.dev-logs/` for local runs). Read with
+`hw-devlog --dir <dir> summary|tail|check`; run headless checks through
+`hw-devlog --dir <dir> run -- ./build/hw_agent …` and report `check`.
+
 ## Conventions
 
 - `ponytail:` comments mark deliberate simplifications + upgrade path.

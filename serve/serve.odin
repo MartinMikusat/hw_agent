@@ -39,6 +39,7 @@ import "core:sync"
 import "core:sync/chan"
 import "core:sys/posix"
 import "core:thread"
+import devlog "devlog:."
 
 import "../agent"
 import "../ai"
@@ -385,9 +386,10 @@ create_session :: proc(d: ^Daemon, model: string) -> (^Live_Session, string) {
 start_session :: proc(d: ^Daemon, id, path, new_model: string) -> (^Live_Session, string) {
 	a := d.allocator
 	sess, messages, err := session.open(path, a)
-	if err != nil { return nil, fmt.tprintf("session open failed: %v", err) }
+	if err != nil { return nil, fmt.tprintf("session open failed: %v", err) } // recorded by session.open
 	if len(new_model) > 0 {
 		if herr := session.append_header(sess, new_model); herr != nil {
+			devlog.failed(devlog.global(), {feature = "session", operation = "create"}, {reason = "session header could not be written"})
 			session.close(sess)
 			return nil, fmt.tprintf("session create failed: %v", herr)
 		}
@@ -576,6 +578,7 @@ conn_write :: proc(c: ^Conn, line: []u8) {
 	defer sync.mutex_unlock(&c.mu)
 	if c.dead || c.closed { return }
 	if c.queued + len(line) > MAX_OUTBOUND_BYTES {
+		devlog.failed(devlog.global(), {feature = "daemon", operation = "send"}, {reason = "client fell too far behind and was disconnected", severity = .Warning})
 		c.dead = true
 		posix.shutdown(c.fd, .RDWR)
 		sync.cond_signal(&c.cond)

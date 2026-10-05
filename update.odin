@@ -12,6 +12,7 @@ import "core:os"
 import "core:strings"
 import "core:thread"
 import "core:time"
+import devlog "devlog:."
 
 import native_update "native_update:."
 import "serve"
@@ -62,12 +63,16 @@ update_worker :: proc(data: rawptr) {
 			native_update.discard(&prepared)
 			if message == "" {
 				fmt.eprintfln("hw_agent: updated %s → %s; restarting", APP_VERSION, prepared.manifest.version)
-				os.exit(0)
+				devlog.succeeded(devlog.global(), {feature = "updater", operation = "apply"})
+				exit(0)
 			}
 			serve.reopen(worker.daemon)
 			fmt.eprintfln("hw_agent: update failed: %s", message)
+			// message comes from native_update's fixed set of literals
+			devlog.failed(devlog.global(), {feature = "updater", operation = "apply"}, {reason = message})
 		case .Error:
 			fmt.eprintfln("hw_agent: update check failed: %s", prepared.error)
+			devlog.failed(devlog.global(), {feature = "updater", operation = "check"}, {reason = prepared.error, severity = .Warning})
 			native_update.discard(&prepared)
 		case .Up_To_Date, .Idle, .Checking:
 			native_update.discard(&prepared)

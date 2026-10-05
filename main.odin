@@ -13,6 +13,7 @@ import "agent"
 import "ai"
 import "compact"
 import "keychain"
+import devlog "devlog:."
 import "rpc"
 import "session"
 import "tools"
@@ -60,17 +61,25 @@ main :: proc() {
 			}
 		}
 	}
+	// The daemon and one-shot commands keep separate journals: each owns its run marker.
+	config := devlog.DEFAULT_CONFIG
+	config.profile = devlog.profile_from_env()
+	if devlog.global_start(devlog.default_directory("hw_agent", mode == "-serve" ? "daemon" : "cli"), config) {
+		context.assertion_failure_proc = devlog.fatal_hook()
+	}
+	defer devlog.global_destroy()
+
 	switch mode {
 	case "-install":
-		os.exit(install(model_id))
+		exit(install(model_id))
 	case "-login":
-		os.exit(login())
+		exit(login())
 	case "-uninstall":
-		os.exit(uninstall())
+		exit(uninstall())
 	}
 	if len(prompt) == 0 && !rpc_mode && mode == "" {
 		fmt.eprintln(USAGE)
-		os.exit(1)
+		exit(1)
 	}
 
 	api_key := os.get_env(API_KEY_ENV, context.allocator)
@@ -79,12 +88,12 @@ main :: proc() {
 	}
 	if len(api_key) == 0 {
 		fmt.eprintln("no OpenRouter API key: run hw_agent -login (or set OPENROUTER_API_KEY)")
-		os.exit(1)
+		exit(1)
 	}
 
 	cfg := base_config(model_id, api_key)
 	if mode == "-serve" {
-		os.exit(serve_daemon(cfg))
+		exit(serve_daemon(cfg))
 	}
 	ctx := agent.Context {
 		system_prompt = SYSTEM_PROMPT,
@@ -104,7 +113,7 @@ main :: proc() {
 		sess, messages, serr = session.open(session_path, context.allocator)
 		if serr != nil {
 			fmt.eprintfln("session open failed: %v", serr)
-			os.exit(1)
+			exit(1)
 		}
 		if len(messages) > 0 {
 			if !rpc_mode {
@@ -133,7 +142,7 @@ main :: proc() {
 	fmt.println()
 	if err != nil {
 		fmt.eprintfln("run failed: %v", err)
-		os.exit(1)
+		exit(1)
 	}
 }
 
@@ -161,6 +170,12 @@ make_tools :: proc(allocator: mem.Allocator) -> []agent.Tool_Definition {
 	list[2] = tools.write_tool(file_state)
 	list[3] = tools.edit_tool(file_state)
 	return list
+}
+
+// exit closes the dev log first, so a deliberate exit is never read as a crash.
+exit :: proc(code: int) -> ! {
+	devlog.global_destroy()
+	os.exit(code)
 }
 
 print_sink :: proc(event: agent.Event, userdata: rawptr) {
