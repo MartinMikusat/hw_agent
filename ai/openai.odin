@@ -58,6 +58,7 @@ OpenAI_Stream :: struct {
 	cause: string,
 	http_code: i32,
 	http_message: string,
+	trace: ^os.File, // nil unless provider_options.trace_dir is set
 }
 
 // MAX_ERROR_DETAIL bounds the provider message kept for replies and the dev log.
@@ -381,6 +382,9 @@ stream_openai :: proc(
 	}
 	retained = true
 	devlog.started(devlog.global(), {feature = "provider", operation = "stream"})
+	if len(model.provider_options.trace_dir) > 0 {
+		impl.trace = open_trace(model.provider_options.trace_dir, body)
+	}
 
 	return Stream {
 		data = impl,
@@ -409,11 +413,34 @@ openai_stream_close :: proc(s: ^Stream) {
 		_, _ = os.process_wait(impl.process)
 	}
 	bufio.reader_destroy(&impl.reader)
+	if impl.trace != nil { os.close(impl.trace) }
 	remove_temp_file(impl.request_path)
 	remove_temp_file(impl.config_path)
 	remove_temp_file(impl.stderr_log)
 	free(impl, impl.allocator)
 	s.data = nil
+}
+
+// open_trace creates <dir>/<unix-ms>-<n>.jsonl (owner-only) and writes the
+// request body as its first line. Tracing is a debugging aid: a failure is
+// recorded and the request proceeds untraced.
+trace_counter: u64
+
+open_trace :: proc(dir, body: string) -> ^os.File {
+	if err := os.make_directory_all(dir, os.perm(0o700)); err != nil && !os.is_dir(dir) {
+		devlog.failed(devlog.global(), {feature = "provider", operation = "trace"}, {reason = "trace directory could not be created", severity = .Warning})
+		return nil
+	}
+	n := sync.atomic_add(&trace_counter, 1)
+	path := fmt.tprintf("%s/%d-%d.jsonl", dir, time.to_unix_nanoseconds(time.now()) / 1e6, n)
+	f, err := os.open(path, {.Write, .Create, .Excl}, os.perm(0o600))
+	if err != nil {
+		devlog.failed(devlog.global(), {feature = "provider", operation = "trace"}, {reason = "trace file could not be created", severity = .Warning})
+		return nil
+	}
+	_, _ = os.write_string(f, body)
+	_, _ = os.write_string(f, "\n")
+	return f
 }
 
 remove_temp_file :: proc(path: string) {
@@ -529,6 +556,10 @@ stream_next :: proc(s: ^Stream) -> (Event, bool) {
 		}
 		if len(os.get_env("HW_DEBUG", context.temp_allocator)) > 0 {
 			fmt.eprintfln("[sse] %s", line)
+		}
+		if impl.trace != nil {
+			_, _ = os.write_string(impl.trace, line)
+			_, _ = os.write_string(impl.trace, "\n")
 		}
 		event, has := handle_sse_line(impl, line)
 		if has {

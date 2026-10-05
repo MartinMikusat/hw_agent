@@ -75,6 +75,9 @@ Provider_Options :: struct {
 	zdr: bool,
 	timeout_ms: int,
 	endpoint: string, // trusted caller configuration; empty uses OpenRouter
+	// trace_dir, when set, receives one file per request: the request body on the
+	// first line, then every raw response line. Holds conversation content.
+	trace_dir: string,
 }
 
 Error :: enum {

@@ -114,6 +114,10 @@ main :: proc() {
 	if mode == "-serve" {
 		exit(serve_daemon(cfg))
 	}
+	if tracing_enabled() {
+		cfg.model.provider_options.trace_dir = cli_trace_dir()
+		start_trace_pruning(traces_dir(), false)
+	}
 	ctx := agent.Context {
 		system_prompt = SYSTEM_PROMPT,
 		tools = make_tools(context.allocator),

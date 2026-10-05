@@ -25,6 +25,7 @@ serve_daemon :: proc(base: agent.Loop_Config) -> int {
 	cfg := serve.Config {
 		socket_path   = fmt.aprintf("%s/agent.sock", dir),
 		sessions_dir  = fmt.aprintf("%s/sessions", dir),
+		traces_dir    = tracing_enabled() ? traces_dir() : "",
 		default_model = base.model.id,
 		system_prompt = SYSTEM_PROMPT,
 		base          = base,
@@ -43,6 +44,7 @@ serve_daemon :: proc(base: agent.Loop_Config) -> int {
 	fmt.eprintfln("hw_agent %s -serve: listening on %s", APP_VERSION, cfg.socket_path)
 	devlog.started(devlog.global(), {feature = "daemon", operation = "serve"})
 	update_start(d)
+	if len(cfg.traces_dir) > 0 { start_trace_pruning(cfg.traces_dir, true) }
 	serve.run(d)
 	return 0
 }

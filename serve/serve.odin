@@ -454,6 +454,9 @@ start_session :: proc(d: ^Daemon, id, path, new_model: string) -> (^Live_Session
 	append(&ls.ctx.messages, ..messages)
 	ls.cfg = d.cfg.base
 	ls.cfg.model.id = len(sess.model) > 0 ? sess.model : d.cfg.default_model
+	if len(d.cfg.traces_dir) > 0 {
+		ls.cfg.model.provider_options.trace_dir = fmt.aprintf("%s/%s", d.cfg.traces_dir, ls.id, allocator = a)
+	}
 	ls.sink = {write = fan_out, userdata = ls, session = ls.id}
 	rpc.init_server(&ls.srv, &ls.cfg, &ls.cancel, &ls.sink, a)
 	ls.srv.ctx = &ls.ctx

@@ -47,6 +47,11 @@ overrides; use `.dev-logs/` for local runs). Read with
 `hw-devlog --dir <dir> summary|tail|check`; run headless checks through
 `hw-devlog --dir <dir> run -- ./build/hw_agent …` and report `check`.
 
+Raw provider traces (`HW_DEVLOG_PROFILE=dev` only): one file per request under
+`~/Library/Application Support/hw_agent/traces/<session-id|cli>/`, request body
+on the first line, then raw response lines; pruned after 30 days. They hold
+conversation content, never the API key.
+
 ## Conventions
 
 - `ponytail:` comments mark deliberate simplifications + upgrade path.
