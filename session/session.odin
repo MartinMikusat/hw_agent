@@ -219,6 +219,7 @@ emit :: proc(event: agent.Event, userdata: rawptr) {
 			tool_call_id = e.id,
 			text        = e.text,
 			is_error    = e.is_error,
+			duration_ms = e.duration_ms,
 			timestamp   = time.to_unix_seconds(time.now()),
 		})
 	}

@@ -52,7 +52,7 @@ run :: proc(
 	emit(Event_Agent_Start{}, emit_userdata)
 	emit(Event_Turn_Start{}, emit_userdata)
 
-	pending := drain(cfg.get_steering, cfg.userdata, allocator)
+	pending := mark(drain(cfg.get_steering, cfg.userdata, allocator), .Steer)
 	turns := 0
 	for {
 		has_more := true
@@ -109,13 +109,13 @@ run :: proc(
 				emit(Event_Agent_End{}, emit_userdata)
 				return nil
 			}
-			pending = drain(cfg.get_steering, cfg.userdata, allocator)
+			pending = mark(drain(cfg.get_steering, cfg.userdata, allocator), .Steer)
 			if len(pending) > 0 || has_more {
 				emit(Event_Turn_Start{}, emit_userdata)
 			}
 		}
 
-		follow_up := drain(cfg.get_follow_up, cfg.userdata, allocator)
+		follow_up := mark(drain(cfg.get_follow_up, cfg.userdata, allocator), .Follow_Up)
 		if len(follow_up) == 0 {
 			break
 		}
@@ -125,6 +125,13 @@ run :: proc(
 
 	emit(Event_Agent_End{}, emit_userdata)
 	return nil
+}
+
+mark :: proc(messages: []Agent_Message, delivery: Delivery) -> []Agent_Message {
+	for &m in messages {
+		if m.role == .User { m.delivery = delivery }
+	}
+	return messages
 }
 
 drain :: proc(get: proc(rawptr) -> []Agent_Message, userdata: rawptr, allocator: mem.Allocator) -> []Agent_Message {
@@ -183,6 +190,7 @@ stream_assistant :: proc(
 		}
 		llm_ctx.tools = tool_defs[:]
 
+		attempt_started := time.tick_now()
 		stream, serr := cfg.stream(cfg.model, llm_ctx, cfg.api_key, cancel, allocator)
 		if serr != nil {
 			return -1, serr == .Aborted ? .Aborted : .Stream_Failed
@@ -222,6 +230,7 @@ stream_assistant :: proc(
 				}
 				final := stream.result(&stream)
 				ctx.messages[idx] = assistant_from_wire(final, ctx.messages[idx].timestamp)
+				stamp(&ctx.messages[idx], cfg, attempt_started)
 				if !started {
 					emit(Event_Message_Start{message = &ctx.messages[idx]}, emit_userdata)
 				}
@@ -250,6 +259,7 @@ stream_assistant :: proc(
 				ctx.messages[idx].stop_reason = ev.reason == .Aborted ? .Aborted : .Error
 				ctx.messages[idx].tool_calls = nil
 				ctx.messages[idx].text = ev.text
+				stamp(&ctx.messages[idx], cfg, attempt_started)
 				if !started {
 					emit(Event_Message_Start{message = &ctx.messages[idx]}, emit_userdata)
 				}
@@ -282,6 +292,7 @@ stream_assistant :: proc(
 			}
 			final := stream.result(&stream)
 			ctx.messages[idx] = assistant_from_wire(final, ctx.messages[idx].timestamp)
+			stamp(&ctx.messages[idx], cfg, attempt_started)
 			if !started {
 				emit(Event_Message_Start{message = &ctx.messages[idx]}, emit_userdata)
 			}
@@ -291,6 +302,12 @@ stream_assistant :: proc(
 	}
 }
 
+// stamp records which model answered and how long the request took.
+stamp :: proc(msg: ^Agent_Message, cfg: ^Loop_Config, started: time.Tick) {
+	msg.model = cfg.model.id
+	msg.duration_ms = i64(time.duration_milliseconds(time.tick_since(started)))
+}
+
 sync_partial :: proc(dst: ^Agent_Message, src: ^ai.Message) {
 	dst.text = src.text
 	dst.thinking = src.thinking
@@ -298,12 +315,13 @@ sync_partial :: proc(dst: ^Agent_Message, src: ^ai.Message) {
 	dst.tool_calls = src.tool_calls
 }
 
-append_result :: proc(ctx: ^Context, call_id: string, text: string, is_error: bool) {
+append_result :: proc(ctx: ^Context, call_id: string, text: string, is_error: bool, duration_ms: i64 = 0) {
 	append(&ctx.messages, Agent_Message {
 		role = .Tool_Result,
 		tool_call_id = call_id,
 		text = text,
 		is_error = is_error,
+		duration_ms = duration_ms,
 		timestamp = time.to_unix_seconds(time.now()),
 	})
 }
@@ -403,8 +421,8 @@ execute_tool_calls :: proc(
 					job.result = run_tool(job.tool, job.call, cancel, allocator)
 				}
 			}
-			append_result(ctx, job.call.id, job.result.text, job.result.is_error)
-			emit(Event_Tool_End{id = job.call.id, name = job.call.name, text = job.result.text, is_error = job.result.is_error}, emit_userdata)
+			append_result(ctx, job.call.id, job.result.text, job.result.is_error, job.result.duration_ms)
+			emit(Event_Tool_End{id = job.call.id, name = job.call.name, text = job.result.text, is_error = job.result.is_error, duration_ms = job.result.duration_ms}, emit_userdata)
 		}
 		return all_continue(jobs)
 	}
@@ -414,8 +432,8 @@ execute_tool_calls :: proc(
 		if job.result.terminate {
 			has_more = false
 		}
-		append_result(ctx, job.call.id, job.result.text, job.result.is_error)
-		emit(Event_Tool_End{id = job.call.id, name = job.call.name, text = job.result.text, is_error = job.result.is_error}, emit_userdata)
+		append_result(ctx, job.call.id, job.result.text, job.result.is_error, job.result.duration_ms)
+		emit(Event_Tool_End{id = job.call.id, name = job.call.name, text = job.result.text, is_error = job.result.is_error, duration_ms = job.result.duration_ms}, emit_userdata)
 	}
 	return has_more
 }
@@ -434,7 +452,9 @@ run_tool :: proc(tool: ^Tool_Definition, call: ai.Tool_Call, cancel: ^ai.Cancell
 	if perr != nil {
 		return Tool_Result{text = fmt.aprintf("Invalid tool arguments: %v", perr, allocator = allocator), is_error = true}
 	}
+	started := time.tick_now()
 	result := tool.execute(call.id, args, cancel, nil, tool.userdata)
+	result.duration_ms = i64(time.duration_milliseconds(time.tick_since(started)))
 	output_limit := tool.max_output_bytes > 0 ? tool.max_output_bytes : TOOL_OUTPUT_MAX_CHARS
 	if len(result.text) > output_limit {
 		result.text = fmt.aprintf(

@@ -216,6 +216,20 @@ test_steering_and_followup :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expect(t, found_follow, "follow-up message must reach the model")
+
+	// the transcript records how each user message arrived and who answered
+	for m in ctx.messages {
+		switch m.role {
+		case .User:
+			want := Delivery.Prompt
+			if m.text == "steered" { want = .Steer }
+			if m.text == "followed" { want = .Follow_Up }
+			testing.expect_value(t, m.delivery, want)
+		case .Assistant:
+			testing.expect_value(t, m.model, "fake")
+		case .Tool_Result, .Bash_Execution, .Custom, .Branch_Summary, .Compaction_Summary:
+		}
+	}
 }
 
 @(test)

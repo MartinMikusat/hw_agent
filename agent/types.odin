@@ -18,6 +18,14 @@ Agent_Role :: enum {
 	Compaction_Summary,
 }
 
+// How a user message reached the run: the prompt that started it, a steer
+// injected mid-run, or a follow-up queued for when it settled.
+Delivery :: enum {
+	Prompt,
+	Steer,
+	Follow_Up,
+}
+
 Agent_Message :: struct {
 	role:         Agent_Role,
 	text:         string,          // user text, tool output, summary text, bash output
@@ -29,6 +37,9 @@ Agent_Message :: struct {
 	usage:        ai.Usage,        // role == .Assistant
 	stop_reason:  ai.Stop_Reason,  // role == .Assistant
 	timestamp:    i64,             // unix seconds
+	model:        string,          // role == .Assistant: model that produced it
+	duration_ms:  i64,             // .Assistant: provider request; .Tool_Result: execution
+	delivery:     Delivery,        // role == .User
 }
 
 Context :: struct {
@@ -56,6 +67,7 @@ Tool_Definition :: struct {
 Tool_Result :: struct {
 	text:      string,
 	is_error:  bool,
+	duration_ms: i64, // set by the loop
 	terminate: bool, // tool asks the loop to stop after this batch
 }
 
@@ -114,10 +126,11 @@ Event_Tool_Start :: struct {
 }
 
 Event_Tool_End :: struct {
-	id:       string,
-	name:     string,
-	text:     string,
-	is_error: bool,
+	id:          string,
+	name:        string,
+	text:        string,
+	is_error:    bool,
+	duration_ms: i64,
 }
 
 Emit :: proc(event: Event, userdata: rawptr)
