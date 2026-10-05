@@ -129,7 +129,7 @@ approval_srv :: proc(capture: ^Capture, rule: permissions.Rule) -> ^Server {
 	srv.sink = new_clone(Line_Sink{write = capture_write, userdata = capture, listening = capture_listening}, context.temp_allocator)
 	rules := make([]permissions.Rule, 1, context.temp_allocator)
 	rules[0] = rule
-	srv.gate = new_clone(permissions.Gate{rules = rules, cwd = "/work", allocator = runtime.heap_allocator()}, context.temp_allocator)
+	srv.gate = new_clone(permissions.Gate{rules = rules, ask_timeout = permissions.DEFAULT_ASK_TIMEOUT, cwd = "/work", allocator = runtime.heap_allocator()}, context.temp_allocator)
 	set_permissions(srv, srv.gate)
 	return srv
 }
@@ -194,14 +194,14 @@ test_permission_without_an_answer :: proc(t: ^testing.T) {
 
 	// nobody answers: denied after the timeout
 	capture.listening = true
-	srv.ask_timeout = 250 * time.Millisecond
+	srv.gate.ask_timeout = 250 * time.Millisecond
 	started := time.tick_now()
 	block, reason = srv.cfg.before_tool_call(call, srv)
 	testing.expect(t, block && strings.contains(reason, "No approval was given"), reason)
 	testing.expect(t, time.tick_since(started) < 3 * time.Second)
 
 	// abort ends the wait at once
-	srv.ask_timeout = time.Minute
+	srv.gate.ask_timeout = time.Minute
 	run := Hook_Run{srv = srv, call = call}
 	th := start_hook(&run)
 	wait_line(&capture, `"id":"p2"`)

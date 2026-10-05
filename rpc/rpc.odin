@@ -71,10 +71,7 @@ Server :: struct {
 
 	gate:        ^permissions.Gate, // nil: every tool call is allowed
 	approval:    Approval,
-	ask_timeout: time.Duration,      // 0 = PERMISSION_TIMEOUT
 }
-
-PERMISSION_TIMEOUT :: 5 * time.Minute
 
 Decision_Kind :: enum {
 	Deny,
@@ -401,7 +398,7 @@ ask :: proc(srv: ^Server, call: ai.Tool_Call, decision: permissions.Decision) ->
 		"id" = id, "tool" = ap.tool, "target" = ap.target, "arguments" = ap.arguments, "rule" = ap.rule,
 	})
 
-	timeout := srv.ask_timeout > 0 ? srv.ask_timeout : PERMISSION_TIMEOUT
+	timeout := srv.gate.ask_timeout
 	deadline := time.tick_add(time.tick_now(), timeout)
 	outcome := "timeout"
 	sync.mutex_lock(&ap.mu)

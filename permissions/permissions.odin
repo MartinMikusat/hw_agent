@@ -23,6 +23,7 @@ import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:strings"
+import "core:time"
 
 import devlog "devlog:."
 
@@ -53,8 +54,11 @@ Grant :: struct {
 
 // Gate holds one session's rules and its in-memory grants. Not thread-safe: it
 // is used from the loop thread only.
+DEFAULT_ASK_TIMEOUT :: 5 * time.Minute
+
 Gate :: struct {
 	rules:        []Rule,
+	ask_timeout:  time.Duration, // how long a client has to answer an ask
 	cwd:          string,
 	grants:       [dynamic]Grant,
 	auto_approve: bool, // answer every ask with allow (-yes)
@@ -74,7 +78,8 @@ File_Rule :: struct {
 }
 
 File :: struct {
-	rules: []File_Rule,
+	rules:               []File_Rule,
+	ask_timeout_seconds: int, // 0 = unset
 }
 
 // parse_file is strict: unknown keys and wrong types are errors, because a typo
@@ -84,9 +89,21 @@ parse_file :: proc(data: []u8) -> (file: File, valid: bool) {
 	value, err := json.parse(data, allocator = context.temp_allocator)
 	if err != nil { return }
 	root, is_object := value.(json.Object)
-	if !is_object || len(root) != 1 { return }
+	if !is_object { return }
 	list, is_array := root["rules"].(json.Array)
 	if !is_array { return }
+	for key, field in root {
+		switch key {
+		case "rules":
+		case "ask_timeout_seconds":
+			seconds, is_number := field.(json.Float)
+			whole, is_integer := field.(json.Integer)
+			if is_integer { seconds, is_number = json.Float(whole), true }
+			if !is_number || seconds < 1 || seconds > 86_400 || seconds != json.Float(int(seconds)) { return }
+			file.ask_timeout_seconds = int(seconds)
+		case: return
+		}
+	}
 	rules := make([]File_Rule, len(list), context.temp_allocator)
 	for item, i in list {
 		obj, ok := item.(json.Object)
@@ -102,7 +119,8 @@ parse_file :: proc(data: []u8) -> (file: File, valid: bool) {
 			}
 		}
 	}
-	return File{rules}, true
+	file.rules = rules
+	return file, true
 }
 
 // load builds the gate for a session in cwd from the global file and the
@@ -110,36 +128,39 @@ parse_file :: proc(data: []u8) -> (file: File, valid: bool) {
 // is an error, never silently permissive.
 load :: proc(cwd, global_path: string, allocator := context.allocator) -> (gate: ^Gate, err: string) {
 	rules := make([dynamic]Rule, 0, 8, allocator)
+	ask_timeout := DEFAULT_ASK_TIMEOUT
 	if len(global_path) > 0 {
-		list, ferr := load_file(global_path, .Global, allocator)
+		list, seconds, ferr := load_file(global_path, .Global, allocator)
 		if ferr != "" { return nil, ferr }
 		append(&rules, ..list)
+		if seconds > 0 { ask_timeout = time.Duration(seconds) * time.Second }
 	}
 	project_path := fmt.tprintf("%s/.hw_agent/permissions.json", instructions.find_root(cwd))
-	list, ferr := load_file(project_path, .Project, allocator)
+	list, _, ferr := load_file(project_path, .Project, allocator) // a repository does not set the user's timeout
 	if ferr != "" { return nil, ferr }
 	append(&rules, ..list)
 
 	gate = new(Gate, allocator)
 	gate.rules = rules[:]
+	gate.ask_timeout = ask_timeout
 	gate.cwd = strings.clone(cwd, allocator)
 	gate.allocator = allocator
 	gate.grants = make([dynamic]Grant, 0, 4, allocator)
 	return gate, ""
 }
 
-load_file :: proc(path: string, source: Source, allocator := context.allocator) -> (rules: []Rule, err: string) {
-	if !os.is_file(path) { return nil, "" }
+load_file :: proc(path: string, source: Source, allocator := context.allocator) -> (rules: []Rule, ask_timeout_seconds: int, err: string) {
+	if !os.is_file(path) { return nil, 0, "" }
 	site := devlog.Site{feature = "permissions", operation = "load"}
 	data, rerr := os.read_entire_file(path, context.temp_allocator)
 	if rerr != nil {
 		devlog.failed(devlog.global(), site, {reason = "permissions file could not be read", detail = basename(path)})
-		return nil, fmt.aprintf("permissions file %s could not be read", basename(path), allocator = allocator)
+		return nil, 0, fmt.aprintf("permissions file %s could not be read", basename(path), allocator = allocator)
 	}
 	file, valid := parse_file(data)
 	if !valid {
 		devlog.failed(devlog.global(), site, {reason = "permissions file is not valid", detail = basename(path)})
-		return nil, fmt.aprintf("permissions file %s must be {{\"rules\":[{{\"action\":\"allow|ask|deny\",\"tool\":\"…\",\"match\":\"…\"}}]}} with no other keys", basename(path), allocator = allocator)
+		return nil, 0, fmt.aprintf("permissions file %s must be {{\"rules\":[{{\"action\":\"allow|ask|deny\",\"tool\":\"…\",\"match\":\"…\"}}]}} with no other keys", basename(path), allocator = allocator)
 	}
 	out := make([dynamic]Rule, 0, len(file.rules), allocator)
 	for r, i in file.rules {
@@ -150,11 +171,11 @@ load_file :: proc(path: string, source: Source, allocator := context.allocator) 
 		case "deny":  action = .Deny
 		case:
 			devlog.failed(devlog.global(), site, {reason = "permissions rule has an unknown action", detail = basename(path)})
-			return nil, fmt.aprintf("permissions file %s: rule %d has action %q (use allow, ask or deny)", basename(path), i + 1, r.action, allocator = allocator)
+			return nil, 0, fmt.aprintf("permissions file %s: rule %d has action %q (use allow, ask or deny)", basename(path), i + 1, r.action, allocator = allocator)
 		}
 		if len(r.tool) == 0 {
 			devlog.failed(devlog.global(), site, {reason = "permissions rule has no tool", detail = basename(path)})
-			return nil, fmt.aprintf("permissions file %s: rule %d has no tool", basename(path), i + 1, allocator = allocator)
+			return nil, 0, fmt.aprintf("permissions file %s: rule %d has no tool", basename(path), i + 1, allocator = allocator)
 		}
 		if source == .Project && action == .Allow {
 			devlog.failed(devlog.global(), site, {reason = "project permissions file has allow rules, which are ignored", severity = .Warning, detail = basename(path)})
@@ -162,7 +183,7 @@ load_file :: proc(path: string, source: Source, allocator := context.allocator) 
 		}
 		append(&out, Rule{action, strings.clone(r.tool, allocator), strings.clone(r.match, allocator), source})
 	}
-	return out[:], ""
+	return out[:], file.ask_timeout_seconds, ""
 }
 
 // evaluate decides one tool call.
