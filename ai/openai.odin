@@ -200,6 +200,11 @@ request_json :: proc(model: Model, ctx: Context, allocator: mem.Allocator) -> (s
 	if model.max_output > 0 {
 		root["max_completion_tokens"] = json.Integer(model.max_output)
 	}
+	if model.reasoning_effort != "" {
+		reasoning := make(map[string]json.Value, 1)
+		reasoning["effort"] = json.String(strings.clone(model.reasoning_effort))
+		root["reasoning"] = json.Value(json.Object(reasoning))
+	}
 	provider_options := model.provider_options
 	if provider_options.require_parameters || provider_options.data_collection_deny || provider_options.zdr {
 		provider := make(map[string]json.Value, 3)

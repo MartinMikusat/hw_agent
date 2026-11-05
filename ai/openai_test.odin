@@ -83,7 +83,7 @@ test_sse_combined_deltas_and_request_contract :: proc(t: ^testing.T) {
 	testing.expect(t, impl.final.usage.complete && impl.final.usage.cost_reported)
 	testing.expect_value(t, impl.final.usage.cost_usd, 0.001)
 	model := Model {
-		id = "fixture", max_output = 123,
+		id = "fixture", max_output = 123, reasoning_effort = "max",
 		provider_options = {require_parameters = true, data_collection_deny = true, zdr = true},
 	}
 	body, err := request_json(model, Context{messages = []Message{impl.final}}, context.allocator)
@@ -92,6 +92,7 @@ test_sse_combined_deltas_and_request_contract :: proc(t: ^testing.T) {
 	testing.expect(t, perr == nil)
 	root := value.(json.Object)
 	testing.expect_value(t, json_int(root["max_completion_tokens"]), 123)
+	testing.expect_value(t, string(root["reasoning"].(json.Object)["effort"].(json.String)), "max")
 	provider := root["provider"].(json.Object)
 	testing.expect_value(t, bool(provider["require_parameters"].(json.Boolean)), true)
 	testing.expect_value(t, string(provider["data_collection"].(json.String)), "deny")

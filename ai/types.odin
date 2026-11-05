@@ -66,6 +66,7 @@ Model :: struct {
 	id:             string,
 	context_window: int,
 	max_output:     int,
+	reasoning_effort: string, // sent as reasoning.effort; empty uses the provider default
 	data:           rawptr, // provider- or caller-specific routing hint
 	provider_options: Provider_Options,
 	response_schema_json: string,
