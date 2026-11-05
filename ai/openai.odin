@@ -707,6 +707,9 @@ handle_sse_line :: proc(impl: ^OpenAI_Stream, line: string) -> (Event, bool) {
 			impl.usage.output = output
 			impl.usage.total = total
 			impl.usage.complete = has_input && has_output && has_total
+			if details, has_details := usage_obj["completion_tokens_details"].(json.Object); has_details {
+				impl.usage.reasoning, _ = usage_token_count(details["reasoning_tokens"])
+			}
 			if cost, has_cost := usage_obj["cost"]; has_cost {
 				#partial switch n in cost {
 				case json.Float:

@@ -223,3 +223,17 @@ test_stalled_stream_cancellation_deadline_and_cleanup :: proc(t: ^testing.T) {
 		testing.expect(t, !os.exists(path))
 	}
 }
+
+@(test)
+usage_records_reasoning_tokens :: proc(t: ^testing.T) {
+	arena: mem.Dynamic_Arena
+	mem.dynamic_arena_init(&arena)
+	defer mem.dynamic_arena_destroy(&arena)
+	context.allocator = mem.dynamic_arena_allocator(&arena)
+	impl := new(OpenAI_Stream)
+	impl.allocator = context.allocator
+	impl.partial.role = .Assistant
+	handle_sse_line(impl, `data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"completion_tokens_details":{"reasoning_tokens":3}}}`)
+	testing.expect_value(t, impl.usage.reasoning, 3)
+	testing.expect_value(t, impl.usage.output, 5)
+}

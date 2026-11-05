@@ -19,6 +19,7 @@ Usage :: struct {
 	input:  int,
 	output: int,
 	total:  int, // provider-reported total incl. cache; 0 when unreported
+	reasoning: int, // part of output spent on reasoning; 0 when unreported
 	cost_usd: f64,
 	cost_reported: bool,
 	complete: bool,
