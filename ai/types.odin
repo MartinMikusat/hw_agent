@@ -76,6 +76,7 @@ Model :: struct {
 
 Provider_Options :: struct {
 	require_parameters: bool,
+	only: string, // the one router endpoint slug to use, with no fallback; empty lets the router choose
 	data_collection_deny: bool,
 	zdr: bool,
 	timeout_ms: int,

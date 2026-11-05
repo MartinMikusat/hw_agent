@@ -242,3 +242,33 @@ usage_records_reasoning_tokens :: proc(t: ^testing.T) {
 	testing.expect_value(t, impl.usage.cached, 8)
 	testing.expect_value(t, impl.usage.output, 5)
 }
+
+@(test)
+request_json_is_byte_stable_across_requests :: proc(t: ^testing.T) {
+	arena: mem.Dynamic_Arena
+	mem.dynamic_arena_init(&arena)
+	defer mem.dynamic_arena_destroy(&arena)
+	context.allocator = mem.dynamic_arena_allocator(&arena)
+	parameters := `{"type":"object","properties":{"alpha":{"type":"string","maxLength":5},"beta":{"type":"integer","minimum":1,"maximum":3},"gamma":{"type":"array","items":{"type":"string"}},"delta":{"type":"boolean"}},"required":["alpha"],"additionalProperties":false}`
+	tools := []Tool_Definition{{name = "one", description = "First", parameters_json = parameters}, {name = "two", description = "Second", parameters_json = parameters}}
+	model := Model{id = "fixture", max_output = 10, reasoning_effort = "max", provider_options = {require_parameters = true}}
+	messages := []Message{{role = .User, text = "Question"}}
+	first, first_err := request_json(model, Context{messages = messages, tools = tools}, context.allocator)
+	testing.expect_value(t, first_err, Error.None)
+	for _ in 0 ..< 8 {
+		next, next_err := request_json(model, Context{messages = messages, tools = tools}, context.allocator)
+		testing.expect_value(t, next_err, Error.None)
+		testing.expect_value(t, next, first)
+	}
+}
+
+@(test)
+request_json_pins_one_provider_without_fallback :: proc(t: ^testing.T) {
+	arena: mem.Dynamic_Arena
+	mem.dynamic_arena_init(&arena)
+	defer mem.dynamic_arena_destroy(&arena)
+	context.allocator = mem.dynamic_arena_allocator(&arena)
+	body, err := request_json(Model{id = "fixture", provider_options = {only = "together"}}, Context{messages = []Message{{role = .User, text = "Q"}}}, context.allocator)
+	testing.expect_value(t, err, Error.None)
+	testing.expect(t, strings.contains(body, `"provider":{"allow_fallbacks":false,"order":["together"]}`), body)
+}

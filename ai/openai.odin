@@ -206,8 +206,14 @@ request_json :: proc(model: Model, ctx: Context, allocator: mem.Allocator) -> (s
 		root["reasoning"] = json.Value(json.Object(reasoning))
 	}
 	provider_options := model.provider_options
-	if provider_options.require_parameters || provider_options.data_collection_deny || provider_options.zdr {
+	if provider_options.require_parameters || provider_options.only != "" || provider_options.data_collection_deny || provider_options.zdr {
 		provider := make(map[string]json.Value, 3)
+		if provider_options.only != "" {
+			order := make([dynamic]json.Value, 0, 1)
+			append(&order, json.String(strings.clone(provider_options.only)))
+			provider["order"] = json.Value(json.Array(order))
+			provider["allow_fallbacks"] = json.Boolean(false)
+		}
 		if provider_options.require_parameters {
 			provider["require_parameters"] = json.Boolean(true)
 		}
@@ -223,11 +229,12 @@ request_json :: proc(model: Model, ctx: Context, allocator: mem.Allocator) -> (s
 		root["tools"] = json.Value(json.Array(tools))
 	}
 
-	text, uerr := json.unparse(json.Value(json.Object(root)), {}, allocator)
+	// Map order follows each map's address. Sorted keys keep every request's prefix byte-stable, which provider caches need.
+	bytes, uerr := json.marshal(json.Value(json.Object(root)), {spec = .JSON, sort_maps_by_key = true}, allocator)
 	if uerr != nil {
 		return "", .Parse
 	}
-	return text, nil
+	return string(bytes), nil
 }
 
 write_temp_file :: proc(contents: string, allocator: mem.Allocator) -> (path: string, err: os.Error) {
