@@ -21,6 +21,8 @@ Usage :: struct {
 	total:  int, // provider-reported total incl. cache; 0 when unreported
 	reasoning: int, // part of output spent on reasoning; 0 when unreported
 	cached: int, // part of input served from the provider cache; 0 when unreported
+	provider: string, // who served the request, when the router reports it
+	generation_id: string, // the router's request id
 	cost_usd: f64,
 	cost_reported: bool,
 	complete: bool,

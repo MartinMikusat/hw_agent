@@ -703,6 +703,12 @@ handle_sse_line :: proc(impl: ^OpenAI_Stream, line: string) -> (Event, bool) {
 		return {}, false
 	}
 
+	if impl.usage.provider == "" {
+		if provider, is_text := obj["provider"].(json.String); is_text {impl.usage.provider = textutil.clean(string(provider), impl.allocator)}
+	}
+	if impl.usage.generation_id == "" {
+		if id, is_text := obj["id"].(json.String); is_text {impl.usage.generation_id = textutil.clean(string(id), impl.allocator)}
+	}
 	if usage_v, has := obj["usage"]; has {
 		if usage_obj, uok := usage_v.(json.Object); uok {
 			input, has_input := usage_token_count(usage_obj["prompt_tokens"])

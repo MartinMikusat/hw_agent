@@ -234,6 +234,9 @@ usage_records_reasoning_tokens :: proc(t: ^testing.T) {
 	impl := new(OpenAI_Stream)
 	impl.allocator = context.allocator
 	impl.partial.role = .Assistant
+	handle_sse_line(impl, `data: {"id":"gen-1","provider":"Together","choices":[]}`)
+	testing.expect_value(t, impl.usage.provider, "Together")
+	testing.expect_value(t, impl.usage.generation_id, "gen-1")
 	handle_sse_line(impl, `data: {"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15,"prompt_tokens_details":{"cached_tokens":8},"completion_tokens_details":{"reasoning_tokens":3}}}`)
 	testing.expect_value(t, impl.usage.reasoning, 3)
 	testing.expect_value(t, impl.usage.cached, 8)

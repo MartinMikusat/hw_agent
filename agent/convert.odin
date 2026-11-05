@@ -54,6 +54,8 @@ convert_to_llm :: proc(messages: []Agent_Message, allocator: mem.Allocator) -> [
 // allocator, so it can outlive the arena its stream was allocated in.
 own_message :: proc(msg: ^Agent_Message, allocator: mem.Allocator) {
 	msg.text = strings.clone(msg.text, allocator)
+	msg.usage.provider = strings.clone(msg.usage.provider, allocator)
+	msg.usage.generation_id = strings.clone(msg.usage.generation_id, allocator)
 	msg.thinking = strings.clone(msg.thinking, allocator)
 	msg.reasoning_details_json = strings.clone(msg.reasoning_details_json, allocator)
 	if len(msg.tool_calls) > 0 {
